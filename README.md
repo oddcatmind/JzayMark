@@ -1,32 +1,42 @@
 # JzayMark
 
-English | [简体中文](./README.zh-CN.md)
+简体中文 | [English](./README.en.md)
 
-A lightweight custom markup language builder based on Markdown.
+一个以 Markdown 为基准的轻量自定义标记语言生成引擎。
 
-Define custom tags in the simplest and most flexible way.
+让你以最简洁、灵活的方式，定义属于自己的标记语言。
 
-## Core API reference
+只需一个配置文件，即可定义 `<x>hello</x>` 或各种风格的自定义标签，在你的系统和生态中轻松调用，同时支持 Markdown 语法。
 
-| API | Purpose | Input | Returns | On error |
+## 核心 API 词典
+
+| API / 类型 | 做什么 | 输入或结构 | 返回 | 出错时 |
 | --- | --- | --- | --- | --- |
-| `configure(config)` | Set global defaults and custom tags | `config: { defaults?, nodes }` | `DeepReadonly<JzayMarkConfig>` | Throws `JzayMarkError`: `INVALID_CONFIG` (invalid configuration) |
-| `parse(text, options?)` | Convert Markdown and custom tags into the standard AST | `text: string`; `options?: { version?, mode?: 'normal' \| 'loose' }` | `JzayAst` | Normal mode reports configured-tag syntax errors: `INVALID_MARKER`, `UNCLOSED_MARKER`, `INVALID_ATTRIBUTE`, `DUPLICATE_ATTRIBUTE`, `UNEXPECTED_CLOSE`, `MISMATCHED_CLOSE`, `UNCLOSED_NODE`; both modes report `INVALID_SOURCE`, `INVALID_OPTIONS`, `UNSUPPORTED_VERSION`, and `UNSUPPORTED_MARKDOWN` |
-| `print(ast)` | Convert the standard AST back into Markdown and custom tags | `ast: JzayAst` | `string` | Throws `JzayMarkError`: `UNSUPPORTED_VERSION` (version), `UNKNOWN_NODE` (unconfigured node), `INVALID_AST` (invalid AST), `UNPRINTABLE_PROP` (unprintable attribute) |
+| `configure(config)` | 设置全局属性规则和自定义标签 | `config: { defaults?, nodes }` | 冻结后的 `DeepReadonly<JzayMarkConfig>` | 抛出 `JzayMarkError`：`INVALID_CONFIG` |
+| `parse(text, options?)` | 将 Markdown 与自定义标签转为标准 AST | `text: string`；`options` 只接受 `version`、`mode`，未知选项报 `INVALID_OPTIONS` | `JzayAst` | 正常模式可能报 `INVALID_MARKER`、`UNCLOSED_MARKER`、`INVALID_ATTRIBUTE`、`DUPLICATE_ATTRIBUTE`、`UNEXPECTED_CLOSE`、`MISMATCHED_CLOSE`、`UNCLOSED_NODE`；两种模式都可能报 `INVALID_SOURCE`、`INVALID_OPTIONS`、`UNSUPPORTED_VERSION`、`UNSUPPORTED_MARKDOWN` |
+| `print(ast)` | 将标准 AST 反向输出为 Markdown 与自定义标签 | `ast: JzayAst` | `string` | 抛出 `UNSUPPORTED_VERSION`、`UNKNOWN_NODE`、`INVALID_AST` 或 `UNPRINTABLE_PROP` |
+| `JzayMarkError` | 统一描述配置、解析和输出错误 | `code: JzayMarkErrorCode`、`message: string`、可选的 `location: { line, column, offset }` | — | `JzayMarkErrorCode` 是导出的错误码类型 |
 
-`JzayMarkError` contains `code`, `message`, and an optional `location: { line, column, offset }`; `code` uses the exported `JzayMarkErrorCode` type.
+## 一、快速开始
 
-`parse()` options accept only `version` and `mode`. Unknown options report `INVALID_OPTIONS` instead of being ignored silently.
-
-## 1. Install
+安装：
 
 ```bash
 npm install jzaymark
 ```
 
-## 2. Quick start
+无需配置即可转换原生 Markdown：
 
-### 2.1 Create one configuration file anywhere
+```ts
+import { parse, print } from 'jzaymark'
+
+const ast = parse('# Hello')
+const text = print(ast) // # Hello
+```
+
+## 二、配置您的自定义语法标签
+
+### 2.1 在任意位置创建一个配置文件
 
 ```ts
 // jzaymark.config.ts
@@ -34,7 +44,7 @@ import { configure, parse, print } from 'jzaymark'
 
 configure({
   defaults: {
-    // Nodes without their own props use the color="red" style
+    // 所有未单独设置 props 的 node 默认使用 color="red" 风格
     props: {
       separator: ' ',
       assign: '=',
@@ -43,14 +53,14 @@ configure({
   },
 
   nodes: {
-    // Inherits defaults: <example level="info">Body</example>
-    // parse: parse Markdown and nested custom tags in the body
+    // 继承默认形式：<example level="info">正文</example>
+    // parse：正文继续解析 Markdown 和其他自定义标签
     example: {
       body: 'parse',
     },
 
-    // Independent tag style: [[example2 format="json"]]Body[[/example2]]
-    // Omitted body defaults to raw and is preserved in value
+    // 独立标签形式：[[example2 format="json"]]正文[[/example2]]
+    // body 不写时默认为 raw，正文不解析并保存在 value
     example2: {
       syntax: {
         open: '[[example2 {props}]]',
@@ -58,8 +68,8 @@ configure({
       },
     },
 
-    // Independent tag and property style: @example3(id:"100",enabled)
-    // none: a single tag with no body
+    // 独立标签和属性形式：@example3(id:"100",enabled)
+    // none：单标签，没有正文
     example3: {
       body: 'none',
       syntax: {
@@ -77,138 +87,17 @@ configure({
 export { parse, print }
 ```
 
-Import everything through this file from now on:
+以后在任何地方都只从这个配置文件引入：
 
 ```ts
 import { parse, print } from './jzaymark.config'
 ```
 
-- The system syntax is fixed as `<name>...</name>`; nodes without `syntax` use it automatically.
-- `defaults` configures only the global attribute format; it cannot change system syntax or `body`.
-- A node's `syntax.open` is the complete opening-tag template; `{props}` marks the attribute position.
-- With no attributes, `{props}` and one adjacent whitespace character are removed automatically.
-- `syntax.close` is the complete closing tag for a node with a body.
-- Backslash is the universal escape character, so `syntax.open` and `syntax.close` cannot start with it or contain line breaks.
-- `syntax.close` cannot be a prefix of `syntax.open`, preventing an opening tag from being mistaken for a closing tag.
-- A `body: 'none'` node has no body and only needs `syntax.open`.
-- Node-level `props` fields override matching `defaults.props` fields.
-- `separator`, `assign`, and `quote` must each be one distinct character. `assign` and `quote` cannot be whitespace, and backslash is reserved as the universal escape character.
+### 2.2 配置详细说明
 
-`body` has three forms:
+#### 系统默认形式
 
-| `body` | Tag form | Body result |
-| --- | --- | --- |
-| `raw` or omitted | Paired | Not parsed; stored in `value` after syntax escapes are decoded |
-| `parse` | Paired | Parsed into `children`, including Markdown and nested custom tags |
-| `none` | Single | No body; only `props` remain |
-
-Attributes require no schema. Valued attributes must use the active `quote` and become strings, while bare attributes become `true`. Attribute values use backslash escaping: `\"` represents a quote and `\\` represents a backslash. Raw bodies also use backslash to represent a literal closing delimiter; `print()` performs this encoding automatically.
-
-### 2.2 Text to AST
-
-Native Markdown:
-
-```ts
-import { parse } from './jzaymark.config'
-
-const ast = parse('# Title')
-```
-
-```ts
-{
-  version: 'v1',
-  type: 'document',
-  children: [{
-    type: 'heading',
-    props: { depth: 1 },
-    children: [{ type: 'text', value: 'Title' }],
-  }],
-}
-```
-
-A custom tag:
-
-```ts
-import { parse } from './jzaymark.config'
-
-const ast = parse(
-  '<example level="info">Body with **bold** text</example>',
-)
-```
-
-```ts
-{
-  version: 'v1',
-  type: 'document',
-  children: [{
-    type: 'example',
-    props: { level: 'info' },
-    children: [{
-      type: 'paragraph',
-      children: [
-        { type: 'text', value: 'Body with ' },
-        { type: 'strong', children: [{ type: 'text', value: 'bold' }] },
-        { type: 'text', value: ' text' },
-      ],
-    }],
-  }],
-}
-```
-
-`parse()` uses AST v1 by default. It can also be explicit: `parse(text, { version: 'v1' })`.
-
-### 2.3 AST to text
-
-Output native Markdown:
-
-```ts
-import { print } from './jzaymark.config'
-
-const markdown = print({
-  version: 'v1',
-  type: 'document',
-  children: [{
-    type: 'heading',
-    props: { depth: 1 },
-    children: [{ type: 'text', value: 'Title' }],
-  }],
-})
-
-// # Title
-```
-
-Outputting a custom tag works exactly the same way:
-
-```ts
-import { print } from './jzaymark.config'
-
-const markdown = print({
-  version: 'v1',
-  type: 'document',
-  children: [{
-    type: 'example',
-    props: { level: 'info' },
-    children: [{
-      type: 'paragraph',
-      children: [{ type: 'text', value: 'Body' }],
-    }],
-  }],
-})
-
-// <example level="info">
-// Body
-// </example>
-```
-
-## 3. Configuration precedence
-
-Later levels override earlier levels:
-
-```text
-System fallback → defaults → node configuration
-```
-
-The system fallback is:
+未单独设置时，每个 node 自动使用：
 
 ```ts
 {
@@ -218,15 +107,124 @@ The system fallback is:
 }
 ```
 
-1. With no configuration, the system fallback applies.
-2. `configure.defaults.props` overrides the system attribute format field by field.
-3. Each node then overrides `defaults` field by field.
-4. For duplicate or conflicting matches at the same level, the node declared later wins.
-5. Custom syntax is recognized before Markdown, so a later node may intentionally override a conflicting Markdown construct.
+因此 `{ example: {} }` 默认使用 `<example>...</example>`；带属性时写作 `<example color="red">...</example>`。node 名必须以英文字母开头，后面可以使用英文字母、数字、`_`、`.`、`:`、`-`，且不能与标准 AST 节点名冲突。
 
-When a conflict affects output, `print()` automatically tries an equivalent Markdown form, such as `_emphasis_` instead of `*emphasis*`. If an AST node truly cannot be represented losslessly under the active configuration, `print()` reports `INVALID_AST`. An older node fully shadowed by a later declaration is never emitted as the wrong node.
+#### `syntax`：标签长什么样
 
-## 4. Standard AST structure
+- `syntax.open` 是完整的开始标签模板，`{props}` 表示属性插入位置；不需要属性时可以省略 `{props}`。
+- 没有属性时，`{props}` 及其紧邻的一个空白会自动移除。
+- `syntax.close` 是有正文标签的完整结束标签；`body: 'none'` 不能设置 `close`。
+- `{props}` 最多出现一次，且前后都要有固定语法；`close` 中不能出现 `{props}`。
+- `open` 和 `close` 不能以反斜杠开头或包含换行，也不能相同；`close` 不能是 `open` 的前缀。
+
+#### `props`：属性怎么分隔和赋值
+
+| 字段 | 含义 | 默认值 |
+| --- | --- | --- |
+| `separator` | 多个属性之间的分隔符 | 空格 |
+| `assign` | 属性名与属性值之间的赋值符 | `=` |
+| `quote` | 属性值的包裹符 | `"` |
+
+三个字段都必须是互不相同的单个 Unicode 字符，且不能使用反斜杠；`assign` 和 `quote` 不能是空白字符。
+
+属性无需提前声明：`color="red"` 记录为 `{ color: 'red' }`，只有属性名的 `disabled` 记录为 `{ disabled: true }`。带值属性必须使用当前 `quote` 包裹。属性名不能包含空白、反斜杠或当前的 `separator`、`assign`、`quote`。
+
+反斜杠是统一转义符。属性值中的 `\"` 表示引号、`\\` 表示反斜杠，也支持 `\n`、`\r`、`\t`；`print()` 会自动完成必要的编码。
+
+#### `body`：正文如何处理
+
+| `body` | 标签形式 | AST 中的正文 |
+| --- | --- | --- |
+| `raw` 或不写 | 成对标签 | 不继续解析，解码转义后保存在 `value` |
+| `parse` | 成对标签 | 解析到 `children`，支持 Markdown 和自定义标签嵌套 |
+| `none` | 单标签 | 没有正文，只保留 `props` |
+
+`raw` 正文中的字面量结束标签也使用反斜杠转义，`print()` 会自动编码，下一次 `parse()` 会还原原值。
+
+#### 配置生效顺序
+
+配置按以下顺序生效，后面的覆盖前面的：
+
+```text
+系统默认 → defaults.props → node 单项配置
+```
+
+1. `configure.defaults.props` 按字段覆盖系统属性格式。
+2. node 中的 `props` 再按字段覆盖 `defaults.props`；node 的 `syntax` 和 `body` 只作用于自身。
+3. 同一层级出现重复或冲突的语法时，`nodes` 中后声明的 node 优先。
+4. 自定义语法先于 Markdown 识别，所以后声明的 node 可以有意覆盖冲突的 Markdown 指令。
+
+当冲突影响输出时，`print()` 会尝试等价的 Markdown 写法，例如将 `*强调*` 改为 `_强调_`。如果当前配置无法无损表达某个 AST 节点，或者一个旧 node 已被后续配置完全覆盖，`print()` 会报 `INVALID_AST`，不会输出错误内容。
+
+## 三、文本转 AST
+
+无论是原生 Markdown 还是自定义标签，均可一键转化：
+
+```ts
+import { parse } from './jzaymark.config'
+
+const ast = parse(`
+# 标题
+
+<example level="info">正文 **加粗**</example>
+`.trim())
+```
+
+```ts
+{
+  version: 'v1',
+  type: 'document',
+  children: [
+    {
+      type: 'heading',
+      props: { depth: 1 },
+      children: [{ type: 'text', value: '标题' }],
+    },
+    {
+      type: 'example',
+      props: { level: 'info' },
+      children: [{
+        type: 'paragraph',
+        children: [
+          { type: 'text', value: '正文 ' },
+          { type: 'strong', children: [{ type: 'text', value: '加粗' }] },
+        ],
+      }],
+    },
+  ],
+}
+```
+
+`parse()` 默认使用 AST v1，也可以显式传入 `parse(text, { version: 'v1' })`。
+
+## 四、AST 转文本
+
+AST 转文本同样简单高效：
+
+```ts
+import { print } from './jzaymark.config'
+
+const text = print({
+  version: 'v1',
+  type: 'document',
+  children: [{
+    type: 'example',
+    props: { level: 'info' },
+    children: [{
+      type: 'paragraph',
+      children: [{ type: 'text', value: '正文' }],
+    }],
+  }],
+})
+
+// <example level="info">
+// 正文
+// </example>
+```
+
+Markdown 节点与自定义节点使用同一个 `print()`，不需要区分输出方式。
+
+## 五、AST 标准结构
 
 ```ts
 type JsonValue =
@@ -251,68 +249,88 @@ interface JzayAst {
 }
 ```
 
-- `type`: node name.
-- `props`: tag attributes or Markdown node metadata.
-- `value`: text, code, or a `raw` body.
-- `children`: parsed child nodes.
-- `version`: present only on the root; currently `v1`.
+标准示例：
 
-The official AST core will not change lightly. The `v1` marker exists so parsing and printing can identify the structure if an exceptional future change is ever required. Unsupported versions fail explicitly instead of being used silently.
-
-`print()` strictly validates the fields and values allowed by each standard node and automatically reparses its candidate output before returning it. Output is returned only when the reparsed AST matches the input; otherwise `INVALID_AST` is reported instead of silently dropping or changing data. Block and phrasing children must appear in the matching placement; empty or adjacent `text` nodes and other non-canonical structures that Markdown would rewrite are rejected as well. JzayMark does not generate `html` nodes; raw HTML tags, comments, and declarations in Markdown are all treated as plain text.
-
-The bundled JSON Schema validates the configuration-independent document envelope and generic node shape. Standard-node details, custom-node rules, and lossless printability under the active configuration are enforced by `print()`.
-
-### Normal and loose modes
-
-`parse()` uses normal mode by default. Use `parse(text, { mode: 'loose' })` when error recovery is needed.
-
-Unknown tags and other raw HTML fragments are plain text in both modes and never create custom AST nodes. Loose mode recovers only configured tags; when their structure cannot be identified reliably, it preserves the source without deleting content or guessing a repair.
-
-| Scenario | Normal mode `normal` | Loose mode `loose` |
-| --- | --- | --- |
-| Configured, valid tag | Parse with the node's `syntax`, `props`, and `body` | Same behavior |
-| Unconfigured tag | Preserve both opening and closing tags as plain text while parsing Markdown between them normally | Same behavior |
-| Duplicate attribute | Report `DUPLICATE_ATTRIBUTE` | Keep the first value and ignore later duplicates |
-| Invalid attribute syntax | Report `INVALID_ATTRIBUTE` | Preserve the complete tag source as plain text; continue parsing after a single tag, and preserve the body and closing tag with a paired tag |
-| Extra closing tag for a configured node | Report `UNEXPECTED_CLOSE` | Preserve only that closing tag source as plain text |
-| Mismatched closing tag for a configured node | Report `MISMATCHED_CLOSE` | Preserve source from the currently open inner tag as plain text while allowing the valid outer tag to close; in `<a><b>body</a>`, `<b>body` is plain text inside `<a>` |
-| Unclosed tag | Report `UNCLOSED_NODE` | Preserve the source from the opening tag to the end of its current parent or the end of the input as plain text |
-| Invalid or incomplete tag delimiter | Report `INVALID_MARKER` or `UNCLOSED_MARKER` | Preserve the unrecognizable tag fragment exactly as plain text |
-| Escaped tag | Preserve it as plain text | Same behavior |
-| Tag inside inline or fenced code | Preserve it as code | Same behavior |
-| Invalid input type or AST version | Report the error | Report the same error without recovery |
-
-JzayMark only parses and prints. Rendering, data loading, and business validation belong to the caller.
-
-Requires Node.js 18 or newer. Supports ESM, CommonJS, and TypeScript.
-
-## 5. FAQ
-
-### How do I display custom tags as plain text?
-
-Add a backslash before the custom tag's `open`. This works for every custom syntax, including delimiters that Markdown itself would not escape. Escape both the opening and closing tags for a paired tag:
-
-```text
-\<example>plain text\</example>
+```ts
+{
+  version: 'v1',
+  type: 'document',
+  children: [{
+    type: 'paragraph',
+    children: [
+      { type: 'text', value: 'Hello ' },
+      { type: 'strong', children: [{ type: 'text', value: 'JzayMark' }] },
+    ],
+  }],
+}
 ```
 
-### How is invalid syntax handled?
+- `type`：节点名称。
+- `props`：标签属性或 Markdown 节点信息。
+- `value`：文本、代码或 `raw` 正文。
+- `children`：解析后的子节点。
+- `version`：只标记在根节点，目前为 `v1`。
 
-Normal mode reports problems to the caller through a `JzayMarkError` containing an error code and source location. Use `parse(text, { mode: 'loose' })` for automatic recovery; see “Normal and loose modes” above for the exact rules.
+官方不会轻易改变 AST 的核心结构。保留 `v1` 是为了在极特殊情况下必须调整结构时仍能明确识别版本；不支持的版本会直接报错。
 
-### Are custom tags parsed inside inline or fenced code?
+随包提供的 JSON Schema 用于检查不依赖配置的根结构和通用节点外形。标准节点细则、自定义 node 规则以及当前配置能否无损输出，由 `print()` 完成最终校验。
 
-No. Content inside Markdown inline code and fenced code blocks is always preserved as code.
+## 六、正常模式与宽松模式
 
-### Does `print()` reproduce the original source exactly?
+`parse()` 默认使用正常模式；需要容错行为时使用 `parse(text, { mode: 'loose' })`。
 
-`print()` guarantees semantic stability across `text → AST → text → AST`, but it may normalize attribute order, quotes, and Markdown formatting. Byte-for-byte reproduction is not guaranteed.
+未知标签及其他原始 HTML 片段在两种模式下都作为普通文字，不生成自定义 AST 节点。宽松模式只对已配置标签进行容错；无法确认结构时保留原文，不删除内容，也不猜测修复结构。
 
-If plain `text` or a `raw` body contains configured syntax delimiters, `print()` adds the required backslashes automatically and the next `parse()` restores the original value.
+| 场景 | 正常模式 `normal` | 宽松模式 `loose` |
+| --- | --- | --- |
+| 已配置且格式正确的标签 | 按 node 的 `syntax`、`props` 和 `body` 解析 | 处理相同 |
+| 未配置的标签 | 开始标签和结束标签都作为普通文字，标签之间的 Markdown 正常解析 | 处理相同 |
+| 重复属性 | 报 `DUPLICATE_ATTRIBUTE` | 保留第一个值，忽略后续同名属性 |
+| 属性格式错误 | 报 `INVALID_ATTRIBUTE` | 将该标签的完整原文作为普通文本保留；单标签后面的内容继续解析，成对标签同时保留正文和结束标签 |
+| 已配置标签出现多余的结束标签 | 报 `UNEXPECTED_CLOSE` | 只将该结束标签原文作为普通文字保留 |
+| 已配置标签的结束标签不匹配 | 报 `MISMATCHED_CLOSE` | 从当前未闭合的内层开始标签起作为普通文字，外层正确标签仍正常解析；例如 `<a><b>正文</a>` 中 `<b>正文` 是 `<a>` 内的普通文字 |
+| 标签未闭合 | 报 `UNCLOSED_NODE` | 将开始标签到当前父节点末尾或文本末尾的原文作为普通文本保留 |
+| 标签格式或定界符不完整 | 报 `INVALID_MARKER` 或 `UNCLOSED_MARKER` | 将无法可靠识别的标签片段原样作为普通文本保留 |
+| 已转义的标签 | 作为普通文本保留 | 处理相同 |
+| 行内代码或代码块中的标签 | 作为代码原文保留 | 处理相同 |
+| 输入类型、未知 options 或 AST 版本错误 | 直接报错 | 同样直接报错，不进行容错 |
 
-Emoji, rare CJK characters, and other non-BMP Unicode characters are protected as complete internal tokens and restored unchanged after printing; no per-character configuration is required.
+## 七、FAQ
 
-### How many times should `configure()` run?
+### 如何让自定义标签作为普通文本显示？
 
-Run it once when each page, Worker, or Node.js process starts. Calling it again replaces the current configuration as a whole, so dynamic switching during normal application work is not recommended.
+在自定义标签的 `open` 前加反斜杠。成对标签需要分别转义开始和结束标签：
+
+```text
+\<example>普通文本\</example>
+```
+
+### 错误语法如何处理？
+
+正常模式通过 `JzayMarkError` 把错误码、说明和可用的源码位置反馈给调用者。需要自动容错时使用 `parse(text, { mode: 'loose' })`，具体处理方式见第六章。
+
+### 行内代码和代码块中的自定义标签会被解析吗？
+
+不会。Markdown 行内代码和围栏代码块中的内容始终按代码原文保留。
+
+### `print()` 会完全还原原文吗？
+
+`print()` 保证 `文本 → AST → 文本 → AST` 的语义一致，但可能统一属性顺序、引号和 Markdown 格式，不保证逐字符还原原文。
+
+返回文本前，`print()` 会自动重新解析并对比 AST。只有结果与输入一致才会返回；无法无损输出时会报 `INVALID_AST`，不会静默删除或修改数据。
+
+### Emoji 和生僻汉字是否安全？
+
+安全。Emoji、生僻汉字及其他非 BMP Unicode 字符会被完整保护并原样还原，不需要逐个配置。
+
+### JzayMark 是否负责渲染？
+
+不负责。JzayMark 只负责解析和打印；渲染、数据加载和业务校验由调用者实现。Markdown 中的原始 HTML 标签、注释和声明统一作为普通文字处理，不生成 `html` 节点。
+
+### `configure()` 需要执行几次？
+
+每个页面、Worker 或 Node.js 进程启动时执行一次即可。重复调用会用新配置整体替换当前配置，不建议在业务运行过程中动态切换。
+
+### 支持哪些运行环境？
+
+需要 Node.js 18 或更高版本，同时支持 ESM、CommonJS 和 TypeScript。
