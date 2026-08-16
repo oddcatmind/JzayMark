@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/oddcatmind/jzaymark/blob/main/schemas/jzay-ast-v1.schema.json",
+  "title": "JzayMark AST v1",
+  "$comment": "This schema validates the configuration-independent AST envelope and JSON-safe node shape. Node-specific and active-configuration semantics are enforced by print().",
+  "type": "object",
+  "required": ["version", "type", "children"],
+  "properties": {
+    "version": { "const": "v1" },
+    "type": { "const": "document" },
+    "children": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/node" }
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "jsonValue": {
+      "anyOf": [
+        { "type": "null" },
+        { "type": "boolean" },
+        { "type": "number" },
+        { "type": "string" },
+        { "type": "array", "items": { "$ref": "#/$defs/jsonValue" } },
+        { "type": "object", "additionalProperties": { "$ref": "#/$defs/jsonValue" } }
+      ]
+    },
+    "node": {
+      "type": "object",
+      "required": ["type"],
+      "properties": {
+        "type": { "type": "string", "minLength": 1 },
+        "props": {
+          "type": "object",
+          "additionalProperties": { "$ref": "#/$defs/jsonValue" }
+        },
+        "value": { "$ref": "#/$defs/jsonValue" },
+        "children": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/node" }
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

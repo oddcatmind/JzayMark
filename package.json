@@ -1,0 +1,75 @@
+{
+  "name": "jzaymark",
+  "version": "0.4.0",
+  "description": "A lightweight builder for Markdown-based custom markup languages.",
+  "homepage": "https://github.com/oddcatmind/jzaymark#readme",
+  "bugs": {
+    "url": "https://github.com/oddcatmind/jzaymark/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/oddcatmind/jzaymark.git"
+  },
+  "type": "module",
+  "sideEffects": false,
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    },
+    "./schema": "./schemas/jzay-ast-v1.schema.json",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "schemas",
+    "README.md",
+    "README.zh-CN.md",
+    "LICENSE",
+    "THIRD_PARTY_NOTICES.md"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "check": "npm run typecheck && npm run test && npm run build",
+    "prepack": "npm run check"
+  },
+  "keywords": [
+    "markdown",
+    "commonmark",
+    "gfm",
+    "ast",
+    "parser",
+    "markup",
+    "custom-nodes",
+    "language-builder"
+  ],
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "devDependencies": {
+    "@types/mdast": "^4.0.4",
+    "@types/node": "^26.2.0",
+    "fast-check": "^4.9.0",
+    "remark-gfm": "^4.0.1",
+    "remark-parse": "^11.0.0",
+    "remark-stringify": "^11.0.0",
+    "tsup": "^8.5.1",
+    "typescript": "^5.9.3",
+    "unified": "^11.0.5",
+    "vitest": "^4.1.10"
+  },
+  "overrides": {
+    "esbuild": "^0.28.2"
+  }
+}
