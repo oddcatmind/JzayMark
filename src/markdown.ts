@@ -32,6 +32,7 @@ interface ProtectedRange {
 interface TokenRecord {
   node: JzayNode
   block: boolean
+  literal?: string
 }
 
 interface ParseContext {
@@ -42,6 +43,7 @@ interface ParseContext {
   protectedRanges: ProtectedRange[]
   tokens: Map<string, TokenRecord>
   blockNodes: WeakSet<JzayNode>
+  nodeLiterals: WeakMap<JzayNode, string>
 }
 
 interface SyntaxEventBase {
@@ -80,6 +82,8 @@ interface ScanResult {
   close?: ClosingEvent
   fallback?: true
 }
+
+const MAX_PARSE_NESTING_DEPTH = 256
 
 const BASE_STRINGIFY_OPTIONS = {
   fences: true,
@@ -346,9 +350,27 @@ function findSuffix(source: string, cursor: number, suffix: string, quote: strin
   return -1
 }
 
+function lineStartAt(source: string, offset: number): number {
+  for (let cursor = offset - 1; cursor >= 0; cursor -= 1) {
+    if (source[cursor] === '\n' || source[cursor] === '\r') return cursor + 1
+  }
+  return 0
+}
+
+function lineEndAt(source: string, offset: number, end = source.length): number {
+  for (let cursor = offset; cursor < end; cursor += 1) {
+    if (source[cursor] === '\n' || source[cursor] === '\r') return cursor
+  }
+  return end
+}
+
+function lineBreakEndAt(source: string, offset: number): number {
+  if (source[offset] === '\r' && source[offset + 1] === '\n') return offset + 2
+  return offset + 1
+}
+
 function lineFragmentEnd(source: string, start: number, end: number): number {
-  const newline = source.indexOf('\n', start)
-  return newline === -1 || newline >= end ? end : newline
+  return lineEndAt(source, start, end)
 }
 
 function openingEvent(
@@ -534,13 +556,59 @@ function findNextEvent(
 }
 
 function isStandalone(source: string, start: number, end: number): boolean {
-  const lineStart = source.lastIndexOf('\n', start - 1) + 1
-  const nextNewline = source.indexOf('\n', end)
-  const lineEnd = nextNewline === -1 ? source.length : nextNewline
+  const lineStart = lineStartAt(source, start)
+  const lineEnd = lineEndAt(source, end)
   const before = source.slice(lineStart, start)
   const after = source.slice(end, lineEnd)
   const containerPrefix = /^[\t ]*(?:(?:>[\t ]*)|(?:(?:[-+*]|\d+[.)])[\t ]+))*$/
   return containerPrefix.test(before) && /^[\t ]*$/.test(after)
+}
+
+function containerContinuationPrefix(source: string, offset: number): string {
+  const lineStart = lineStartAt(source, offset)
+  const prefix = source.slice(lineStart, offset)
+  let cursor = 0
+  let continuation = ''
+  let insideContainer = false
+  while (cursor < prefix.length) {
+    const whitespace = /^[\t ]+/u.exec(prefix.slice(cursor))?.[0]
+    if (whitespace) {
+      continuation += whitespace
+      cursor += whitespace.length
+      continue
+    }
+    if (prefix[cursor] === '>') {
+      continuation += '>'
+      cursor += 1
+      insideContainer = true
+      continue
+    }
+    const listMarker = /^(?:[-+*]|\d+[.)])([\t ]+)/u.exec(prefix.slice(cursor))
+    if (listMarker) {
+      const marker = listMarker[0]
+      continuation += ' '.repeat(marker.length)
+      cursor += marker.length
+      insideContainer = true
+      continue
+    }
+    return insideContainer ? continuation : ''
+  }
+  return continuation
+}
+
+function stripContainerContinuation(markdown: string, continuation: string): string {
+  if (!continuation) return markdown
+  let result = ''
+  let cursor = 0
+  let lineEnd = lineEndAt(markdown, cursor)
+  while (lineEnd < markdown.length) {
+    const lineBreakEnd = lineBreakEndAt(markdown, lineEnd)
+    result += markdown.slice(cursor, lineBreakEnd)
+    cursor = lineBreakEnd
+    if (markdown.startsWith(continuation, cursor)) cursor += continuation.length
+    lineEnd = lineEndAt(markdown, cursor)
+  }
+  return `${result}${markdown.slice(cursor)}`
 }
 
 function newToken(context: ParseContext, record: TokenRecord): string {
@@ -548,6 +616,7 @@ function newToken(context: ParseContext, record: TokenRecord): string {
   context.nextToken += 1
   context.tokens.set(token, record)
   if (record.block) context.blockNodes.add(record.node)
+  if (record.literal !== undefined) context.nodeLiterals.set(record.node, record.literal)
   return token
 }
 
@@ -640,12 +709,21 @@ function bodyChildren(markdown: string, context: ParseContext, block: boolean): 
   return nodes
 }
 
+function requiresBlockPlacement(nodes: JzayNode[], context: ParseContext): boolean {
+  return nodes.some((node) => (
+    BUILTIN_NODE_TYPES.has(node.type)
+      ? !PHRASING_NODES.has(node.type)
+      : context.blockNodes.has(node)
+  ))
+}
+
 function scan(
   source: string,
   start: number,
   end: number,
   context: ParseContext,
   expected?: ResolvedNodeConfig,
+  depth = 0,
 ): ScanResult {
   let cursor = start
   let markdown = ''
@@ -722,7 +800,11 @@ function scan(
     if (definition.body === 'none') {
       const block = isStandalone(source, event.start, event.end)
       const node: JzayNode = event.props ? { type: definition.name, props: event.props } : { type: definition.name }
-      markdown += newToken(context, { node, block })
+      markdown += newToken(context, {
+        node,
+        block,
+        literal: source.slice(event.start, event.end),
+      })
       cursor = event.end
       continue
     }
@@ -749,12 +831,23 @@ function scan(
         ...(event.props ? { props: event.props } : {}),
         value: decodeRawValue(source.slice(event.end, closeAt), close),
       }
-      markdown += newToken(context, { node, block })
+      markdown += newToken(context, {
+        node,
+        block,
+        literal: source.slice(event.start, closeEnd),
+      })
       cursor = closeEnd
       continue
     }
 
-    const nested = scan(source, event.end, end, context, definition)
+    if (depth >= MAX_PARSE_NESTING_DEPTH) {
+      raise(
+        'INVALID_SOURCE',
+        `自定义节点嵌套不能超过 ${MAX_PARSE_NESTING_DEPTH} 层`,
+        locationAt(source, event.start),
+      )
+    }
+    const nested = scan(source, event.end, end, context, definition, depth + 1)
     if (nested.fallback) {
       markdown += textToken(context, source.slice(event.start, event.end))
       markdown += nested.markdown
@@ -762,13 +855,21 @@ function scan(
       continue
     }
     if (!nested.close) raise('UNCLOSED_NODE', `节点 ${definition.name} 缺少结束标签`, locationAt(source, event.start))
-    const block = isStandalone(source, event.start, nested.close.end)
+    const standalone = isStandalone(source, event.start, nested.close.end)
+    const continuation = containerContinuationPrefix(source, event.start)
+    const bodyMarkdown = stripContainerContinuation(nested.markdown, continuation)
+    const children = bodyChildren(bodyMarkdown, context, standalone)
+    const block = standalone || requiresBlockPlacement(children, context)
     const node: JzayNode = {
       type: definition.name,
       ...(event.props ? { props: event.props } : {}),
-      children: bodyChildren(nested.markdown, context, block),
+      children,
     }
-    markdown += newToken(context, { node, block })
+    markdown += newToken(context, {
+      node,
+      block,
+      literal: source.slice(event.start, nested.close.end),
+    })
     cursor = nested.cursor
   }
 
@@ -837,26 +938,85 @@ function parentNode(type: string, node: MarkdownNode, context: ParseContext, pro
   return result
 }
 
+function phrasingParent(type: string, node: MarkdownNode, context: ParseContext, props?: Props): JzayNode {
+  const children = fromMarkdownChildren(node, context)
+  const result: JzayNode[] = []
+  for (const child of children) {
+    let resolved = child
+    if (context.blockNodes.has(child)) {
+      if (context.mode === 'normal') {
+        raise('UNSUPPORTED_MARKDOWN', `${type} 行内节点不能包含带块级正文的自定义节点 ${child.type}`)
+      }
+      const literal = context.nodeLiterals.get(child)
+      if (literal === undefined) {
+        raise('UNSUPPORTED_MARKDOWN', `${type} 行内节点中的自定义节点 ${child.type} 无法保留为原文`)
+      }
+      resolved = { type: 'text', value: literal }
+    }
+    const previous = result[result.length - 1]
+    if (
+      previous?.type === 'text'
+      && resolved.type === 'text'
+      && typeof previous.value === 'string'
+      && typeof resolved.value === 'string'
+    ) previous.value += resolved.value
+    else result.push(resolved)
+  }
+  const parent: JzayNode = { type, children: result }
+  if (props) parent.props = props
+  return parent
+}
+
+function paragraphNodes(node: MarkdownNode, context: ParseContext): JzayNode[] {
+  const children = fromMarkdownChildren(node, context)
+  const only = children[0]
+  if (children.length === 1 && only && !BUILTIN_NODE_TYPES.has(only.type)) {
+    const definition = context.config.nodes[only.type]
+    if (
+      definition?.body === 'parse'
+      && !context.blockNodes.has(only)
+      && (only.children?.length ?? 0) > 0
+      && !requiresBlockPlacement(only.children ?? [], context)
+    ) {
+      only.children = [{ type: 'paragraph', children: only.children ?? [] }]
+      context.blockNodes.add(only)
+    }
+    return [only]
+  }
+  const result: JzayNode[] = []
+  let phrasing: JzayNode[] = []
+  const flush = () => {
+    if (phrasing.length > 0) result.push({ type: 'paragraph', children: phrasing })
+    phrasing = []
+  }
+  for (const child of children) {
+    if (context.blockNodes.has(child)) {
+      flush()
+      result.push(child)
+    } else phrasing.push(child)
+  }
+  flush()
+  return result
+}
+
 function fromMarkdownNode(node: MarkdownNode, context: ParseContext): JzayNode[] {
   switch (node.type) {
     case 'root':
       return fromMarkdownChildren(node, context)
     case 'text':
       return tokenizedText(node.value ?? '', context)
-    case 'paragraph': {
-      const paragraph = parentNode('paragraph', node, context)
-      const only = paragraph.children?.[0]
-      return paragraph.children?.length === 1 && only && context.blockNodes.has(only) ? [only] : [paragraph]
-    }
+    case 'paragraph':
+      return paragraphNodes(node, context)
     case 'blockquote':
+    case 'tableRow':
+      return [parentNode(node.type, node, context)]
     case 'emphasis':
     case 'strong':
     case 'delete':
-    case 'tableRow':
     case 'tableCell':
-      return [parentNode(node.type, node, context)]
+      return [phrasingParent(node.type, node, context)]
     case 'heading':
-      return [parentNode('heading', node, context, { depth: numberField(node, 'depth') ?? 1 })]
+      return [phrasingParent('heading', node, context, { depth: numberField(node, 'depth') ?? 1 })]
     case 'thematicBreak':
     case 'break':
       return [{ type: node.type }]
@@ -869,7 +1029,7 @@ function fromMarkdownNode(node: MarkdownNode, context: ParseContext): JzayNode[]
     case 'html':
       return [{ type: 'text', value: node.value ?? '' }]
     case 'link':
-      return [parentNode('link', node, context, compactProps([
+      return [phrasingParent('link', node, context, compactProps([
         ['url', stringField(node, 'url') ?? ''], ['title', stringField(node, 'title')],
       ]))]
     case 'image':
@@ -882,17 +1042,26 @@ function fromMarkdownNode(node: MarkdownNode, context: ParseContext): JzayNode[]
         ['ordered', booleanField(node, 'ordered') ?? false], ['start', numberField(node, 'start')],
         ['spread', booleanField(node, 'spread')],
       ]))]
-    case 'listItem':
-      return [parentNode('listItem', node, context, compactProps([
-        ['checked', booleanField(node, 'checked')], ['spread', booleanField(node, 'spread')],
-      ]))]
+    case 'listItem': {
+      const children = fromMarkdownChildren(node, context)
+      const paragraphWasSplit = children.length > (node.children?.length ?? 0)
+      const props = compactProps([
+        ['checked', booleanField(node, 'checked')],
+        ['spread', paragraphWasSplit ? true : booleanField(node, 'spread')],
+      ])
+      return [{
+        type: 'listItem',
+        children,
+        ...(props ? { props } : {}),
+      }]
+    }
     case 'definition':
       return [{ type: 'definition', props: compactProps([
         ['identifier', stringField(node, 'identifier') ?? ''], ['label', stringField(node, 'label')],
         ['url', stringField(node, 'url') ?? ''], ['title', stringField(node, 'title')],
       ]) ?? {} }]
     case 'linkReference':
-      return [parentNode('linkReference', node, context, compactProps([
+      return [phrasingParent('linkReference', node, context, compactProps([
         ['identifier', stringField(node, 'identifier') ?? ''], ['label', stringField(node, 'label')],
         ['referenceType', stringField(node, 'referenceType') ?? 'shortcut'],
       ]))]
@@ -953,6 +1122,7 @@ export function parseMarkdown(
     protectedRanges: codeRanges(initialTree),
     tokens: new Map(),
     blockNodes: new WeakSet(),
+    nodeLiterals: new WeakMap(),
   }
   const scanned = scan(source, 0, source.length, context)
   return createAst(flowChildren(parseMarkdownTree(scanned.markdown), context))
@@ -1026,14 +1196,28 @@ function printAttributes(
   }).join(format.separator)
 }
 
+function replaceToken(markdown: string, token: string, value: string): string {
+  let result = ''
+  let cursor = 0
+  let tokenAt = markdown.indexOf(token)
+  while (tokenAt !== -1) {
+    result += markdown.slice(cursor, tokenAt)
+    const continuation = containerContinuationPrefix(markdown, tokenAt)
+    result += continuation ? value.replace(/\n/gu, `\n${continuation}`) : value
+    cursor = tokenAt + token.length
+    tokenAt = markdown.indexOf(token, cursor)
+  }
+  return `${result}${markdown.slice(cursor)}`
+}
+
 function replaceTokens(markdown: string, context: PrintContext): string {
   let result = markdown
   for (const [token, value] of context.replacements) {
-    result = result.split(token).join(value)
+    result = replaceToken(result, token, value)
     const first = token.codePointAt(0)
     if (first !== undefined) {
       const encoded = `&#x${first.toString(16).toUpperCase()};${token.slice(String.fromCodePoint(first).length)}`
-      result = result.split(encoded).join(value)
+      result = replaceToken(result, encoded, value)
     }
   }
   return result
@@ -1055,6 +1239,7 @@ function protectLiteralText(value: string, context: PrintContext): string {
     protectedRanges: [],
     tokens: new Map(),
     blockNodes: new WeakSet(),
+    nodeLiterals: new WeakMap(),
   }
   let result = ''
   let emittedUntil = 0
