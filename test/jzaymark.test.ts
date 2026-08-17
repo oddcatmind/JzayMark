@@ -157,6 +157,111 @@ describe('parse', () => {
     }])
   })
 
+  it('promotes a parse-body node with flow content out of its surrounding paragraph', () => {
+    const ast = parse('before <callout>\n# heading\n</callout> after')
+    expect(ast.children).toEqual([
+      { type: 'paragraph', children: [{ type: 'text', value: 'before ' }] },
+      {
+        type: 'callout',
+        children: [{
+          type: 'heading',
+          props: { depth: 1 },
+          children: [{ type: 'text', value: 'heading' }],
+        }],
+      },
+      { type: 'paragraph', children: [{ type: 'text', value: ' after' }] },
+    ])
+    expect(parse(print(ast))).toEqual(ast)
+  })
+
+  it('splits a list-item paragraph around an embedded parse-body block', () => {
+    const ast = parse('- before <callout>\n  # heading\n  </callout> after')
+    const item = ast.children[0]?.children?.[0]
+    expect(item?.children).toEqual([
+      { type: 'paragraph', children: [{ type: 'text', value: 'before ' }] },
+      {
+        type: 'callout',
+        children: [{
+          type: 'heading',
+          props: { depth: 1 },
+          children: [{ type: 'text', value: 'heading' }],
+        }],
+      },
+      { type: 'paragraph', children: [{ type: 'text', value: ' after' }] },
+    ])
+    expect(parse(print(ast))).toEqual(ast)
+  })
+
+  it('keeps a parse-body node with phrasing content inline', () => {
+    const ast = parse('before <callout>inline **strong**</callout> after')
+    expect(ast.children).toEqual([{
+      type: 'paragraph',
+      children: [
+        { type: 'text', value: 'before ' },
+        {
+          type: 'callout',
+          children: [
+            { type: 'text', value: 'inline ' },
+            { type: 'strong', children: [{ type: 'text', value: 'strong' }] },
+          ],
+        },
+        { type: 'text', value: ' after' },
+      ],
+    }])
+    expect(parse(print(ast))).toEqual(ast)
+  })
+
+  it.each([
+    '> before <callout>\n> # heading\n> </callout> after',
+    '<callout>\n[[box]]\n- inner\n[[/box]]\n</callout>',
+    '| value |\n| --- |\n| before <callout>inline</callout> after |',
+  ])('round-trips parse-body nesting at Markdown container boundaries: %s', (source) => {
+    const ast = parse(source)
+    expect(parse(print(ast))).toEqual(ast)
+  })
+
+  it.each([
+    '# before <callout>\n- item\n</callout> after',
+    '**before <callout>\n# heading\n</callout> after**',
+    '[before <callout>\n# heading\n</callout> after](https://example.com)',
+    '| value |\n| --- |\n| before <callout>\n# heading\n</callout> after |',
+  ])('rejects a parse-body block inside a phrasing parent in normal mode: %s', (source) => {
+    expect(() => parse(source)).toThrowError(expect.objectContaining({ code: 'UNSUPPORTED_MARKDOWN' }))
+  })
+
+  it.each([
+    '# before <callout>\n- item\n</callout> after',
+    '**before <callout>\n# heading\n</callout> after**',
+    '[before <callout>\n# heading\n</callout> after](https://example.com)',
+    '| value |\n| --- |\n| before <callout>\n# heading\n</callout> after |',
+  ])('preserves a parse-body block as literal text inside a phrasing parent in loose mode: %s', (source) => {
+    const ast = parse(source, { mode: 'loose' })
+    expect(parse(print(ast))).toEqual(ast)
+  })
+
+  it.each([
+    '<callout><product></callout>',
+    '<callout><callout>inner</callout></callout>',
+  ])('unwraps a sole custom child from a redundant paragraph: %s', (source) => {
+    const ast = parse(source)
+    const outer = ast.children[0]
+    expect(outer?.children?.[0]?.type).not.toBe('paragraph')
+    expect(parse(print(ast))).toEqual(ast)
+  })
+
+  it('parses quote-contained custom blocks identically with LF, CRLF, or CR line endings', () => {
+    const source = '> before <callout>\n> # heading\n> </callout> after'
+    const expected = parse(source)
+    expect(parse(source.replace(/\n/gu, '\r\n'))).toEqual(expected)
+    expect(parse(source.replace(/\n/gu, '\r'))).toEqual(expected)
+  })
+
+  it.each(['normal', 'loose'] as const)('limits custom-node nesting depth in %s mode', (mode) => {
+    const depth = 257
+    const source = `${'<callout>'.repeat(depth)}x${'</callout>'.repeat(depth)}`
+    expect(() => parse(source, { mode })).toThrowError(expect.objectContaining({ code: 'INVALID_SOURCE' }))
+  })
+
   it('parses independent node syntax and props formats', () => {
     const ast = parse('[[box tone="info"]]Text @command(id:"100",enabled)[[/box]]')
     expect(ast.children[0]).toEqual({

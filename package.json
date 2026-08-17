@@ -1,6 +1,6 @@
 {
   "name": "jzaymark",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "A lightweight builder for Markdown-based custom markup languages.",
   "homepage": "https://github.com/oddcatmind/jzaymark#readme",
   "bugs": {

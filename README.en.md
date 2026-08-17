@@ -141,6 +141,8 @@ Backslash is the universal escape character. In an attribute value, `\"` represe
 
 A literal closing delimiter inside a `raw` body also uses backslash escaping. `print()` encodes it automatically, and the next `parse()` restores the original value.
 
+`parse` nodes may be nested up to 256 levels. Beyond that limit, both normal and loose modes report `INVALID_SOURCE` so abnormal input cannot exhaust runtime resources.
+
 #### Configuration precedence
 
 Configuration applies in this order, with later levels overriding earlier levels:
@@ -284,7 +286,7 @@ Unknown tags and other raw HTML fragments are plain text in both modes and never
 
 | Scenario | Normal mode `normal` | Loose mode `loose` |
 | --- | --- | --- |
-| Configured, valid tag | Parse with the node's `syntax`, `props`, and `body` | Same behavior |
+| Configured tag with valid syntax and Markdown placement | Parse with the node's `syntax`, `props`, and `body` | Same behavior |
 | Unconfigured tag | Preserve both opening and closing tags as plain text while parsing Markdown between them normally | Same behavior |
 | Duplicate attribute | Report `DUPLICATE_ATTRIBUTE` | Keep the first value and ignore later duplicates |
 | Invalid attribute syntax | Report `INVALID_ATTRIBUTE` | Preserve the complete tag source as plain text; continue parsing after a single tag, and preserve the body and closing tag with a paired tag |
@@ -292,9 +294,11 @@ Unknown tags and other raw HTML fragments are plain text in both modes and never
 | Mismatched closing tag for a configured node | Report `MISMATCHED_CLOSE` | Preserve source from the currently open inner tag as plain text while allowing the valid outer tag to close; in `<a><b>body</a>`, `<b>body` is plain text inside `<a>` |
 | Unclosed tag | Report `UNCLOSED_NODE` | Preserve the source from the opening tag to the end of its current parent or the end of the input as plain text |
 | Invalid or incomplete tag delimiter | Report `INVALID_MARKER` or `UNCLOSED_MARKER` | Preserve the unrecognizable tag fragment exactly as plain text |
+| Custom tag with a block body inside a phrasing Markdown node | Report `UNSUPPORTED_MARKDOWN` | Preserve the complete custom-tag source as plain text without guessing a new placement |
 | Escaped tag | Preserve it as plain text | Same behavior |
 | Tag inside inline or fenced code | Preserve it as code | Same behavior |
 | Invalid input type, unknown options, or AST version | Report the error | Report the same error without recovery |
+| Custom-node nesting beyond 256 levels | Report `INVALID_SOURCE` | Report the same error without recovery |
 
 ## 7. FAQ
 
