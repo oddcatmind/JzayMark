@@ -470,6 +470,457 @@ describe('parse', () => {
   })
 })
 
+describe('syntax sugar', () => {
+  function configureMention() {
+    return configure({
+      nodes: {
+        mention: {
+          body: 'none',
+          syntaxSugar: [{
+            match: /@(?<name>[\p{L}\p{N}_-]{1,64})(?=\s|$|[，。！？,!?])/gu,
+            map: { props: { name: '$name' } },
+          }],
+        },
+      },
+    })
+  }
+
+  it.each(['normal', 'loose'] as const)('recognizes structured sugar in %s mode', (mode) => {
+    configureMention()
+    expect(parse('@刘大猫 请联系 @user_2！', { mode }).children).toEqual([{
+      type: 'paragraph',
+      children: [
+        { type: 'mention', props: { name: '刘大猫' } },
+        { type: 'text', value: ' 请联系 ' },
+        { type: 'mention', props: { name: 'user_2' } },
+        { type: 'text', value: '！' },
+      ],
+    }])
+  })
+
+  it('prints the canonical node syntax and reparses the same AST', () => {
+    configureMention()
+    const ast = parse('@刘大猫 请准备资料')
+    expect(print(ast)).toBe('<mention name="刘大猫"> 请准备资料\n')
+    expect(parse(print(ast))).toEqual(ast)
+  })
+
+  it('produces the same node as canonical syntax for many shortcut names', () => {
+    configureMention()
+    fc.assert(fc.property(
+      fc.string({ unit: fc.constantFrom(...'abcdefghijklmnopqrstuvwxyz0123456789_-'.split('')), minLength: 1, maxLength: 32 }),
+      (name) => {
+        expect(parse(`before @${name} after`)).toEqual(
+          parse(`before <mention name="${name}"> after`),
+        )
+      },
+    ))
+  })
+
+  it('supports synchronous programmable lookup without changing parse()', () => {
+    const users = new Map([['刘欣', { id: 'user-1', name: '刘欣' }]])
+    let observedFrozenInput = false
+    configure({
+      nodes: {
+        mention: {
+          body: 'none',
+          syntaxSugar: [{
+            match: /@(?<name>[\p{L}\p{N}_-]+)/gu,
+            map(match) {
+              observedFrozenInput = Object.isFrozen(match)
+                && Object.isFrozen(match.captures)
+                && Object.isFrozen(match.groups)
+              const name = match.groups.name ?? ''
+              const user = users.get(name)
+              return user ? { props: { id: user.id, name: user.name } } : null
+            },
+          }],
+        },
+      },
+    })
+    expect(parse('@刘欣 和 @未知').children[0]?.children).toEqual([
+      { type: 'mention', props: { id: 'user-1', name: '刘欣' } },
+      { type: 'text', value: ' 和 @未知' },
+    ])
+    expect(observedFrozenInput).toBe(true)
+  })
+
+  it('expands full, numbered, named, literal-dollar, and boolean mappings', () => {
+    configure({
+      nodes: {
+        mention: {
+          body: 'none',
+          syntaxSugar: [{
+            match: /@(([\p{L}]+)-(?<id>\d+))/gu,
+            map: {
+              props: {
+                full: '$0',
+                first: '$1',
+                name: '$2',
+                id: '$id',
+                money: '$$100',
+                active: true,
+              },
+            },
+          }],
+        },
+      },
+    })
+    expect(parse('@刘欣-7').children[0]).toEqual({
+      type: 'mention',
+      props: {
+        full: '@刘欣-7',
+        first: '刘欣-7',
+        name: '刘欣',
+        id: '7',
+        money: '$100',
+        active: true,
+      },
+    })
+  })
+
+  it('inherits raw and parse body modes', () => {
+    configure({
+      nodes: {
+        highlight: {
+          body: 'raw',
+          syntaxSugar: [{
+            match: /==(?<content>[^=\r\n]+)==/gu,
+            map: { body: '$content' },
+          }],
+        },
+        note: {
+          body: 'parse',
+          syntaxSugar: [{
+            match: /::bold::/gu,
+            map: () => ({ body: '**bold**' }),
+          }],
+        },
+      },
+    })
+    const ast = parse('==重点== and ::bold::')
+    expect(ast.children[0]?.children).toEqual([
+      { type: 'highlight', value: '重点' },
+      { type: 'text', value: ' and ' },
+      { type: 'note', children: [{ type: 'strong', children: [{ type: 'text', value: 'bold' }] }] },
+    ])
+    expect(parse(print(ast))).toEqual(ast)
+  })
+
+  it('uses only Markdown text ranges and preserves escapes, code, raw bodies, and destinations', () => {
+    configure({
+      nodes: {
+        mention: {
+          body: 'none',
+          syntaxSugar: [{
+            match: /@(?<name>[\p{L}\p{N}_-]+)/gu,
+            map: { props: { name: '$name' } },
+          }],
+        },
+        raw: {},
+      },
+    })
+    const source = [
+      '\\@escaped and `@inline`',
+      '',
+      '```txt',
+      '@fenced',
+      '```',
+      '',
+      '<raw>@raw</raw>',
+      '',
+      '[label](https://example.com/@destination)',
+    ].join('\n')
+    const ast = parse(source)
+    expect(JSON.stringify(ast)).not.toContain('"type":"mention"')
+    expect(ast.children[0]?.children?.[0]).toEqual({ type: 'text', value: '@escaped and ' })
+    expect(ast.children[1]).toEqual({ type: 'code', props: { lang: 'txt' }, value: '@fenced' })
+    expect(ast.children[2]).toEqual({ type: 'raw', value: '@raw' })
+    expect(ast.children[3]?.children?.[0]?.props?.url).toBe('https://example.com/@destination')
+  })
+
+  it('applies inside Markdown and parse-body text where canonical nodes are legal', () => {
+    configure({
+      nodes: {
+        mention: {
+          body: 'none',
+          syntaxSugar: [{
+            match: /@(?<name>[\p{L}]+)/gu,
+            map: { props: { name: '$name' } },
+          }],
+        },
+        callout: { body: 'parse' },
+      },
+    })
+    const ast = parse('# @标题\n\n**@加粗**\n\n<callout>@内部</callout>')
+    expect(ast.children[0]?.children?.[0]).toEqual({ type: 'mention', props: { name: '标题' } })
+    expect(ast.children[1]?.children?.[0]?.children?.[0]).toEqual({ type: 'mention', props: { name: '加粗' } })
+    expect(ast.children[2]?.children?.[0]).toEqual({ type: 'mention', props: { name: '内部' } })
+  })
+
+  it('never consumes standard custom-node tokens even with a broad sugar pattern', () => {
+    configure({
+      nodes: {
+        standard: { body: 'none' },
+        word: {
+          body: 'none',
+          syntaxSugar: [{ match: /[A-Za-z]+/gu, map: {} }],
+        },
+      },
+    })
+    expect(parse('before <standard> after').children[0]?.children).toEqual([
+      { type: 'word' },
+      { type: 'text', value: ' ' },
+      { type: 'standard' },
+      { type: 'text', value: ' ' },
+      { type: 'word' },
+    ])
+  })
+
+  it('keeps generated bodies out of the same syntax-sugar pass', () => {
+    configure({
+      nodes: {
+        mention: {
+          body: 'none',
+          syntaxSugar: [{
+            match: /@(?<name>[\p{L}]+)/gu,
+            map: { props: { name: '$name' } },
+          }],
+        },
+        wrapper: {
+          body: 'parse',
+          syntaxSugar: [{
+            match: /::user::/gu,
+            map: () => ({ body: '@刘欣' }),
+          }],
+        },
+      },
+    })
+    expect(parse('::user::').children).toEqual([{
+      type: 'wrapper',
+      children: [{ type: 'paragraph', children: [{ type: 'text', value: '@刘欣' }] }],
+    }])
+  })
+
+  it('inherits block placement and leaves an illegal phrasing replacement as text', () => {
+    configure({
+      nodes: {
+        block: {
+          body: 'parse',
+          syntaxSugar: [{
+            match: /::block::/gu,
+            map: () => ({ body: '# Block' }),
+          }],
+        },
+      },
+    })
+    expect(parse('before ::block:: after').children).toEqual([
+      { type: 'paragraph', children: [{ type: 'text', value: 'before ' }] },
+      { type: 'block', children: [{ type: 'heading', props: { depth: 1 }, children: [{ type: 'text', value: 'Block' }] }] },
+      { type: 'paragraph', children: [{ type: 'text', value: ' after' }] },
+    ])
+    expect(parse('**before ::block:: after**').children[0]?.children).toEqual([{
+      type: 'strong',
+      children: [{ type: 'text', value: 'before ::block:: after' }],
+    }])
+  })
+
+  it('prefers the longest match and then the later configured rule', () => {
+    configure({
+      nodes: {
+        short: {
+          body: 'none',
+          syntaxSugar: [{ match: /@all/gu, map: {} }],
+        },
+        long: {
+          body: 'none',
+          syntaxSugar: [{ match: /@all-members/gu, map: {} }],
+        },
+        later: {
+          body: 'none',
+          syntaxSugar: [{ match: /@all/gu, map: {} }],
+        },
+      },
+    })
+    expect(parse('@all-members @all').children[0]?.children).toEqual([
+      { type: 'long' },
+      { type: 'text', value: ' ' },
+      { type: 'later' },
+    ])
+  })
+
+  it('tries the next conflicting rule when a programmable mapper returns null', () => {
+    configure({
+      nodes: {
+        fallback: {
+          body: 'none',
+          syntaxSugar: [{ match: /@user/gu, map: {} }],
+        },
+        declined: {
+          body: 'none',
+          syntaxSugar: [{ match: /@user/gu, map: () => null }],
+        },
+      },
+    })
+    expect(parse('@user').children).toEqual([{ type: 'fallback' }])
+  })
+
+  it.each(['normal', 'loose'] as const)('reports invalid programmable results in %s mode', (mode) => {
+    configure({
+      nodes: {
+        mention: {
+          body: 'none',
+          syntaxSugar: [{ match: /@user/gu, map: () => ({ body: 'invalid' }) }],
+        },
+      },
+    })
+    expect(() => parse('@user', { mode })).toThrowError(expect.objectContaining({ code: 'INVALID_CONFIG' }))
+  })
+
+  it('rejects asynchronous mappers without changing the synchronous parse contract', () => {
+    configure({
+      nodes: {
+        mention: {
+          body: 'none',
+          syntaxSugar: [{
+            match: /@user/gu,
+            map: (async () => ({ props: { id: '1' } })) as never,
+          }],
+        },
+      },
+    })
+    expect(() => parse('@user')).toThrowError(expect.objectContaining({ code: 'INVALID_CONFIG' }))
+  })
+
+  it('rejects malformed rules during configuration or the first unsafe zero-length match', () => {
+    const invalid = [
+      { syntaxSugar: {} },
+      { syntaxSugar: [{ match: '@user', map: {} }] },
+      { syntaxSugar: [{ match: /@user/g, map: {} }] },
+      { syntaxSugar: [{ match: /@user/uy, map: {} }] },
+      { syntaxSugar: [{ match: /(?:)/gu, map: {} }] },
+      { syntaxSugar: [{ match: /@user/gu }] },
+      { body: 'none', syntaxSugar: [{ match: /@user/gu, map: { body: '$0' } }] },
+    ]
+    for (const node of invalid) {
+      expect(() => configure({ nodes: { invalid: node as never } })).toThrowError(
+        expect.objectContaining({ code: 'INVALID_CONFIG' }),
+      )
+    }
+
+    configure({
+      nodes: {
+        runtime: {
+          body: 'none',
+          syntaxSugar: [{ match: /(?=b)/gu, map: {} }],
+        },
+      },
+    })
+    expect(() => parse('b')).toThrowError(expect.objectContaining({ code: 'INVALID_CONFIG' }))
+  })
+
+  it('does not mutate caller RegExp state and returns the configured sugar', () => {
+    const match = /@(?<name>[\p{L}]+)/gu
+    match.lastIndex = 3
+    const configured = configure({
+      nodes: {
+        mention: {
+          body: 'none',
+          syntaxSugar: [{ match, map: { props: { name: '$name' } } }],
+        },
+      },
+    })
+    parse('@刘欣')
+    expect(match.lastIndex).toBe(3)
+    expect(configured.nodes.mention?.syntaxSugar?.[0]?.match.source).toBe(match.source)
+  })
+
+  it('escapes literal text that would otherwise activate syntax sugar on reparse', () => {
+    configureMention()
+    for (let slashes = 0; slashes <= 8; slashes += 1) {
+      const ast: JzayAst = {
+        version: 'v1',
+        type: 'document',
+        children: [{
+          type: 'paragraph',
+          children: [{ type: 'text', value: `${'\\'.repeat(slashes)}@刘大猫 literal` }],
+        }],
+      }
+      expect(parse(print(ast))).toEqual(ast)
+    }
+  })
+
+  it('uses the same backslash escape for sugar that starts with letters', () => {
+    configure({
+      nodes: {
+        todo: {
+          body: 'none',
+          syntaxSugar: [{ match: /TODO/gu, map: {} }],
+        },
+      },
+    })
+    expect(parse('\\TODO')).toEqual({
+      version: 'v1',
+      type: 'document',
+      children: [{ type: 'paragraph', children: [{ type: 'text', value: 'TODO' }] }],
+    })
+    const literal: JzayAst = {
+      version: 'v1',
+      type: 'document',
+      children: [{ type: 'paragraph', children: [{ type: 'text', value: 'TODO' }] }],
+    }
+    expect(parse(print(literal))).toEqual(literal)
+  })
+
+  it('round-trips arbitrary literal text under active punctuation and word sugar', () => {
+    configure({
+      nodes: {
+        mention: {
+          body: 'none',
+          syntaxSugar: [{ match: /@[A-Za-z]+/gu, map: {} }],
+        },
+        todo: {
+          body: 'none',
+          syntaxSugar: [{ match: /TODO/gu, map: {} }],
+        },
+      },
+    })
+    fc.assert(fc.property(
+      fc.string({ unit: fc.constantFrom(...'@TODOabcXYZ012 _-\\'.split('')), maxLength: 80 }),
+      (suffix) => {
+        const ast: JzayAst = {
+          version: 'v1',
+          type: 'document',
+          children: [{ type: 'paragraph', children: [{ type: 'text', value: `literal ${suffix}` }] }],
+        }
+        expect(parse(print(ast))).toEqual(ast)
+      },
+    ))
+  })
+
+  it.each(['\n', '\r\n', '\r'])('recognizes sugar consistently with %j line endings', (lineEnding) => {
+    configureMention()
+    const ast = parse(`@刘欣 first${lineEnding}${lineEnding}@张三 second`)
+    expect(ast.children[0]?.children?.[0]).toEqual({ type: 'mention', props: { name: '刘欣' } })
+    expect(ast.children[1]?.children?.[0]).toEqual({ type: 'mention', props: { name: '张三' } })
+    expect(parse(print(ast))).toEqual(ast)
+  })
+
+  it.each(['normal', 'loose'] as const)('caps generated sugar nodes in %s mode', (mode) => {
+    configure({
+      nodes: {
+        marker: {
+          body: 'none',
+          syntaxSugar: [{ match: /@/gu, map: {} }],
+        },
+      },
+    })
+    expect(() => parse('@'.repeat(10_001), { mode })).toThrowError(
+      expect.objectContaining({ code: 'INVALID_SOURCE' }),
+    )
+  })
+})
+
 describe('print', () => {
   beforeEach(configureLanguage)
 

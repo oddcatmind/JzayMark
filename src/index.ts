@@ -21,6 +21,10 @@ export type {
   NodeConfig,
   PropsConfig,
   SyntaxConfig,
+  SyntaxSugarMapper,
+  SyntaxSugarMapping,
+  SyntaxSugarMatch,
+  SyntaxSugarRule,
 } from './config.js'
 export { JzayMarkError } from './diagnostics.js'
 export type { JzayMarkErrorCode, SourceLocation } from './diagnostics.js'

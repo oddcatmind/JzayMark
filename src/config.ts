@@ -21,10 +21,32 @@ export interface SyntaxConfig {
   close?: string
 }
 
+export interface SyntaxSugarMatch {
+  readonly value: string
+  readonly index: number
+  readonly captures: readonly (string | undefined)[]
+  readonly groups: Readonly<Record<string, string | undefined>>
+}
+
+export interface SyntaxSugarMapping {
+  props?: Record<string, string | true>
+  body?: string
+}
+
+export type SyntaxSugarMapper = (
+  match: SyntaxSugarMatch,
+) => SyntaxSugarMapping | null
+
+export interface SyntaxSugarRule {
+  match: RegExp
+  map: SyntaxSugarMapping | SyntaxSugarMapper
+}
+
 export interface NodeConfig {
   body?: BodyMode
   syntax?: SyntaxConfig
   props?: PropsConfig
+  syntaxSugar?: SyntaxSugarRule[]
 }
 
 export interface DefaultsConfig {
@@ -53,6 +75,15 @@ export interface ResolvedNodeConfig {
   body: BodyMode
   syntax: ResolvedSyntaxConfig
   props: ResolvedPropsConfig
+  syntaxSugar: readonly ResolvedSyntaxSugarRule[]
+}
+
+export interface ResolvedSyntaxSugarRule {
+  source: string
+  flags: string
+  map: SyntaxSugarMapping | SyntaxSugarMapper
+  order: number
+  path: string
 }
 
 export interface ResolvedJzayMarkConfig {
@@ -86,11 +117,96 @@ function dictionary<T>(): Record<string, T> {
 }
 
 function deepFreeze<T>(value: T): DeepReadonly<T> {
+  if (value instanceof RegExp) return value as DeepReadonly<T>
   if (value !== null && typeof value === 'object') {
     for (const child of Object.values(value)) deepFreeze(child)
     Object.freeze(value)
   }
   return value as DeepReadonly<T>
+}
+
+function validMappedPropKey(key: string, format: ResolvedPropsConfig): boolean {
+  if (!key || /[\s\\]/u.test(key) || key.includes(format.assign) || key.includes(format.quote)) return false
+  return /^\s+$/u.test(format.separator) || !key.includes(format.separator)
+}
+
+function copySyntaxSugarMapping(
+  value: unknown,
+  path: string,
+  body: BodyMode,
+  syntax: ResolvedSyntaxConfig,
+  propsFormat: ResolvedPropsConfig,
+): SyntaxSugarMapping {
+  if (!isRecord(value)) raise('INVALID_CONFIG', `${path} 必须是对象或函数`)
+  assertOnlyKeys(value, ['props', 'body'], path)
+  const result: SyntaxSugarMapping = {}
+  if (value.props !== undefined) {
+    if (!isRecord(value.props)) raise('INVALID_CONFIG', `${path}.props 必须是对象`)
+    const props: Record<string, string | true> = Object.create(null) as Record<string, string | true>
+    for (const [key, template] of Object.entries(value.props)) {
+      if (!validMappedPropKey(key, propsFormat)) {
+        raise('INVALID_CONFIG', `${path}.props 的属性名 ${JSON.stringify(key)} 无法由标准语法输出`)
+      }
+      if (typeof template !== 'string' && template !== true) {
+        raise('INVALID_CONFIG', `${path}.props.${key} 必须是字符串或 true`)
+      }
+      props[key] = template
+    }
+    if (Object.keys(props).length > 0 && !syntax.open.includes(PROPS_TOKEN)) {
+      raise('INVALID_CONFIG', `${path}.props 生成了属性，但节点的标准语法没有 ${PROPS_TOKEN}`)
+    }
+    result.props = props
+  }
+  if (value.body !== undefined) {
+    if (body === 'none') raise('INVALID_CONFIG', `${path}.body 不适用于 body 为 none 的节点`)
+    if (typeof value.body !== 'string') raise('INVALID_CONFIG', `${path}.body 必须是字符串`)
+    result.body = value.body
+  }
+  return result
+}
+
+function canMatchEmpty(source: string, flags: string): boolean {
+  const pattern = new RegExp(source, flags.includes('g') ? flags : `${flags}g`)
+  for (const sample of ['', 'a', ' ', '\n', '@', '中', '😀']) {
+    pattern.lastIndex = 0
+    const match = pattern.exec(sample)
+    if (match?.[0] === '') return true
+  }
+  return false
+}
+
+function resolveSyntaxSugar(
+  value: unknown,
+  name: string,
+  body: BodyMode,
+  syntax: ResolvedSyntaxConfig,
+  props: ResolvedPropsConfig,
+  startOrder: number,
+): ResolvedSyntaxSugarRule[] {
+  if (value === undefined) return []
+  if (!Array.isArray(value)) raise('INVALID_CONFIG', `nodes.${name}.syntaxSugar 必须是数组`)
+  return value.map((rule, index) => {
+    const path = `nodes.${name}.syntaxSugar[${index}]`
+    if (!isRecord(rule)) raise('INVALID_CONFIG', `${path} 必须是对象`)
+    assertOnlyKeys(rule, ['match', 'map'], path)
+    if (!(rule.match instanceof RegExp)) raise('INVALID_CONFIG', `${path}.match 必须是正则表达式`)
+    if (!rule.match.flags.includes('u')) raise('INVALID_CONFIG', `${path}.match 必须启用 Unicode u 标志`)
+    if (rule.match.flags.includes('y')) raise('INVALID_CONFIG', `${path}.match 不能使用 sticky y 标志`)
+    if (canMatchEmpty(rule.match.source, rule.match.flags)) {
+      raise('INVALID_CONFIG', `${path}.match 不能匹配空字符串`)
+    }
+    if (rule.map === undefined) raise('INVALID_CONFIG', `${path}.map 是必填字段`)
+    const map = typeof rule.map === 'function'
+      ? rule.map as SyntaxSugarMapper
+      : copySyntaxSugarMapping(rule.map, `${path}.map`, body, syntax, props)
+    return {
+      source: rule.match.source,
+      flags: rule.match.flags,
+      map,
+      order: startOrder + index,
+      path,
+    }
+  })
 }
 
 function assertOnlyKeys(value: Record<string, unknown>, keys: string[], path: string): void {
@@ -202,22 +318,28 @@ export function configure(config: JzayMarkConfig): DeepReadonly<JzayMarkConfig> 
 
   const nodes = dictionary<ResolvedNodeConfig>()
   const orderedNodes: ResolvedNodeConfig[] = []
+  let syntaxSugarOrder = 0
   for (const [name, value] of Object.entries(config.nodes)) {
     if (!NODE_NAME.test(name)) raise('INVALID_CONFIG', `节点名 ${JSON.stringify(name)} 无效`)
     if (BUILTIN_NODE_TYPES.has(name)) {
       raise('INVALID_CONFIG', `节点名 ${JSON.stringify(name)} 与标准 AST 节点冲突`)
     }
     if (!isRecord(value)) raise('INVALID_CONFIG', `nodes.${name} 必须是对象`)
-    assertOnlyKeys(value, ['body', 'syntax', 'props'], `nodes.${name}`)
+    assertOnlyKeys(value, ['body', 'syntax', 'props', 'syntaxSugar'], `nodes.${name}`)
     if (value.body !== undefined && !['parse', 'raw', 'none'].includes(String(value.body))) {
       raise('INVALID_CONFIG', `节点 ${name} 的 body 必须是 parse、raw 或 none`)
     }
     const body = (value.body as BodyMode | undefined) ?? 'raw'
+    const syntax = resolveSyntax(value.syntax, name, body)
+    const props = resolveProps(value.props, defaultProps, `nodes.${name}.props`)
+    const syntaxSugar = resolveSyntaxSugar(value.syntaxSugar, name, body, syntax, props, syntaxSugarOrder)
+    syntaxSugarOrder += syntaxSugar.length
     const definition: ResolvedNodeConfig = {
       name,
       body,
-      syntax: resolveSyntax(value.syntax, name, body),
-      props: resolveProps(value.props, defaultProps, `nodes.${name}.props`),
+      syntax,
+      props,
+      syntaxSugar,
     }
     nodes[name] = definition
     orderedNodes.push(definition)
@@ -237,6 +359,12 @@ export function configure(config: JzayMarkConfig): DeepReadonly<JzayMarkConfig> 
         ...(definition.syntax.close ? { close: definition.syntax.close } : {}),
       },
       props: { ...definition.props },
+      ...(definition.syntaxSugar.length > 0 ? {
+        syntaxSugar: definition.syntaxSugar.map((rule) => ({
+          match: new RegExp(rule.source, rule.flags),
+          map: rule.map,
+        })),
+      } : {}),
     }
   }
   return deepFreeze({

@@ -1,14 +1,14 @@
 {
   "name": "jzaymark",
-  "version": "0.4.1",
+  "version": "0.5.0",
   "description": "A lightweight builder for Markdown-based custom markup languages.",
-  "homepage": "https://github.com/oddcatmind/jzaymark#readme",
+  "homepage": "https://github.com/oddcatmind/jzayMark#readme",
   "bugs": {
-    "url": "https://github.com/oddcatmind/jzaymark/issues"
+    "url": "https://github.com/oddcatmind/jzayMark/issues"
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/oddcatmind/jzaymark.git"
+    "url": "git+https://github.com/oddcatmind/jzayMark.git"
   },
   "type": "module",
   "sideEffects": false,

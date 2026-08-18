@@ -12,8 +12,8 @@
 
 | API / 类型 | 做什么 | 输入或结构 | 返回 | 出错时 |
 | --- | --- | --- | --- | --- |
-| `configure(config)` | 设置全局属性规则和自定义标签 | `config: { defaults?, nodes }` | 冻结后的 `DeepReadonly<JzayMarkConfig>` | 抛出 `JzayMarkError`：`INVALID_CONFIG` |
-| `parse(text, options?)` | 将 Markdown 与自定义标签转为标准 AST | `text: string`；`options` 只接受 `version`、`mode`，未知选项报 `INVALID_OPTIONS` | `JzayAst` | 正常模式可能报 `INVALID_MARKER`、`UNCLOSED_MARKER`、`INVALID_ATTRIBUTE`、`DUPLICATE_ATTRIBUTE`、`UNEXPECTED_CLOSE`、`MISMATCHED_CLOSE`、`UNCLOSED_NODE`；两种模式都可能报 `INVALID_SOURCE`、`INVALID_OPTIONS`、`UNSUPPORTED_VERSION`、`UNSUPPORTED_MARKDOWN` |
+| `configure(config)` | 设置全局属性规则、自定义标签和可选语法糖 | `config: { defaults?, nodes }` | 冻结后的 `DeepReadonly<JzayMarkConfig>` | 抛出 `JzayMarkError`：`INVALID_CONFIG` |
+| `parse(text, options?)` | 将 Markdown、自定义标签和语法糖转为标准 AST | `text: string`；`options` 只接受 `version`、`mode`，未知选项报 `INVALID_OPTIONS` | `JzayAst` | 正常模式可能报 `INVALID_MARKER`、`UNCLOSED_MARKER`、`INVALID_ATTRIBUTE`、`DUPLICATE_ATTRIBUTE`、`UNEXPECTED_CLOSE`、`MISMATCHED_CLOSE`、`UNCLOSED_NODE`；两种模式都可能报 `INVALID_CONFIG`、`INVALID_SOURCE`、`INVALID_OPTIONS`、`UNSUPPORTED_VERSION`、`UNSUPPORTED_MARKDOWN` |
 | `print(ast)` | 将标准 AST 反向输出为 Markdown 与自定义标签 | `ast: JzayAst` | `string` | 抛出 `UNSUPPORTED_VERSION`、`UNKNOWN_NODE`、`INVALID_AST` 或 `UNPRINTABLE_PROP` |
 | `JzayMarkError` | 统一描述配置、解析和输出错误 | `code: JzayMarkErrorCode`、`message: string`、可选的 `location: { line, column, offset }` | — | `JzayMarkErrorCode` 是导出的错误码类型 |
 
@@ -143,6 +143,120 @@ import { parse, print } from './jzaymark.config'
 
 `parse` 节点最多嵌套 256 层。超过限制时，正常模式和宽松模式都会报 `INVALID_SOURCE`，避免异常输入耗尽运行时资源。
 
+#### `syntaxSugar`：标准节点的快捷写法
+
+`syntaxSugar` 是 node 下的可选规则数组。它只负责从普通文字中捕获快捷写法，并把捕获值映射到当前 node 的属性或正文；节点类型、`body`、位置、嵌套、AST 形态和输出格式全部继承 node 本身。
+
+例如给标准单标签 `<mention name="刘大猫">` 增加 `@刘大猫` 快捷写法：
+
+```ts
+configure({
+  nodes: {
+    mention: {
+      body: 'none',
+      syntax: { open: '<mention {props}>' },
+      syntaxSugar: [{
+        match: /@(?<name>[\p{L}\p{N}_-]{1,64})(?=\s|$|[，。！？,!?])/gu,
+        map: {
+          props: { name: '$name' },
+        },
+      }],
+    },
+  },
+})
+```
+
+输入：
+
+```text
+@刘大猫 请准备资料
+```
+
+其中 `@刘大猫` 会生成：
+
+```ts
+{ type: 'mention', props: { name: '刘大猫' } }
+```
+
+`print()` 始终输出 node 的标准 `syntax`，因此完整输出为：
+
+```text
+<mention name="刘大猫"> 请准备资料
+```
+
+每条规则只有两个字段：
+
+| 字段 | 作用 |
+| --- | --- |
+| `match` | JavaScript `RegExp`；必须启用 Unicode `u` 标志，不能使用 sticky `y`，也不能匹配空字符串 |
+| `map` | 结构化 `{ props?, body? }` 映射，或同步返回该结构/`null` 的函数 |
+
+结构化映射支持 `$0`（完整匹配）、`$1` 等编号捕获、`$name` 命名捕获和 `$$` 字面量美元符号：
+
+```ts
+syntaxSugar: [{
+  match: /@(?<name>[\p{L}]+)-(?<id>\d+)/gu,
+  map: {
+    props: {
+      name: '$name',
+      id: '$id',
+      source: '$0',
+      active: true,
+    },
+  },
+}]
+```
+
+需要查询预加载的数据或进行条件判断时，可以使用同步函数。输入对象及其 `captures`、`groups` 都是只读冻结值；返回 `null` 表示保持原始文字：
+
+```ts
+const usersByName = new Map([
+  ['刘大猫', { id: 'user-1', name: '刘大猫' }],
+])
+
+syntaxSugar: [{
+  match: /@(?<name>[\p{L}\p{N}_-]+)/gu,
+  map(match) {
+    const user = usersByName.get(match.groups.name ?? '')
+    return user ? { props: { id: user.id, name: user.name } } : null
+  },
+}]
+```
+
+`parse()` 保持同步，因此 `map` 不能是 `async`，也不应逐次发起网络或数据库请求。需要外部数据时，应先批量加载并建立内存查询表；重名或查不到时建议返回 `null`。函数抛错、返回 Promise、非法字段或不可打印属性时，两种解析模式都会报 `INVALID_CONFIG`。
+
+正文映射完全继承所属节点的 `body`：
+
+```ts
+highlight: {
+  body: 'raw',
+  syntaxSugar: [{
+    match: /==(?<content>[^=\r\n]+)==/gu,
+    map: { body: '$content' }, // 自动进入 value
+  }],
+},
+
+note: {
+  body: 'parse',
+  syntaxSugar: [{
+    match: /::(?<content>[^:\r\n]+)::/gu,
+    map: { body: '$content' }, // 自动解析到 children
+  }],
+},
+```
+
+- `body: 'none'` 禁止映射 `body`。
+- `body: 'raw'` 的 `body` 映射保存到 `value`。
+- `body: 'parse'` 的 `body` 映射解析到 `children`，但生成正文不会在同一轮再次触发语法糖，避免循环转换。
+
+语法糖在正常和宽松模式下都会生效，它不是错误恢复规则。系统先识别标准自定义语法和 Markdown，再只在 Markdown 的普通 `text` 范围运行语法糖；代码、链接/图片地址、`raw` 正文、已识别的标准自定义节点和本轮生成节点不会被匹配。`body: 'parse'` 正文中的普通文字可以继续使用语法糖。
+
+语法糖与标准语法遵循同位等价原则：标准节点在当前位置合法时才转换；例如一个会产生块级正文的节点位于 `strong` 等行内容器时，匹配内容会保留为普通文字，不生成非法 AST。多个规则冲突时，依次选择源码位置最靠前、匹配更长、配置位置更靠后的规则；后选规则的函数返回 `null` 时继续尝试同位置的下一条规则。
+
+反斜杠是语法糖的统一转义符，即使规则从字母开始也适用：`\@刘大猫` 和 `\TODO` 都保留为普通文字。`print()` 会自动保护可能再次触发语法糖的字面文本，并继续保证 `AST → 文本 → AST` 语义一致。单次解析最多生成 10000 个语法糖节点。
+
+原生 JavaScript 正则可能发生灾难性回溯。配置文件中的规则应由可信开发者编写，并避免高风险嵌套量词；如果正则来自远程配置或普通用户输入，应在应用层改用 RE2 等受限引擎，而不是直接构造原生 `RegExp`。
+
 #### 配置生效顺序
 
 配置按以下顺序生效，后面的覆盖前面的：
@@ -155,6 +269,7 @@ import { parse, print } from './jzaymark.config'
 2. node 中的 `props` 再按字段覆盖 `defaults.props`；node 的 `syntax` 和 `body` 只作用于自身。
 3. 同一层级出现重复或冲突的语法时，`nodes` 中后声明的 node 优先。
 4. 自定义语法先于 Markdown 识别，所以后声明的 node 可以有意覆盖冲突的 Markdown 指令。
+5. 语法糖在标准自定义语法和 Markdown 确定普通文本范围后运行；同位置、同长度的冲突由后声明的语法糖获胜。
 
 当冲突影响输出时，`print()` 会尝试等价的 Markdown 写法，例如将 `*强调*` 改为 `_强调_`。如果当前配置无法无损表达某个 AST 节点，或者一个旧 node 已被后续配置完全覆盖，`print()` 会报 `INVALID_AST`，不会输出错误内容。
 
@@ -286,6 +401,9 @@ interface JzayAst {
 | 场景 | 正常模式 `normal` | 宽松模式 `loose` |
 | --- | --- | --- |
 | 已配置且格式、位置都合法的标签 | 按 node 的 `syntax`、`props` 和 `body` 解析 | 处理相同 |
+| 语法糖匹配成功且所属节点在当前位置合法 | 按 `map` 映射为所属节点 | 处理相同 |
+| 语法糖未匹配、函数返回 `null` 或所属节点在当前位置不合法 | 保持普通文字 | 处理相同 |
+| 语法糖函数抛错或返回非法映射 | 报 `INVALID_CONFIG` | 同样直接报错，不进行容错 |
 | 未配置的标签 | 开始标签和结束标签都作为普通文字，标签之间的 Markdown 正常解析 | 处理相同 |
 | 重复属性 | 报 `DUPLICATE_ATTRIBUTE` | 保留第一个值，忽略后续同名属性 |
 | 属性格式错误 | 报 `INVALID_ATTRIBUTE` | 将该标签的完整原文作为普通文本保留；单标签后面的内容继续解析，成对标签同时保留正文和结束标签 |
@@ -308,6 +426,8 @@ interface JzayAst {
 ```text
 \<example>普通文本\</example>
 ```
+
+语法糖也使用相同的反斜杠转义。例如配置了 `@用户名` 或 `TODO` 后，`\@刘大猫` 和 `\TODO` 都按普通文字处理。
 
 ### 错误语法如何处理？
 
