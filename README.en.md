@@ -12,8 +12,8 @@ With one configuration file, define `<x>hello</x>` or custom tags in any style, 
 
 | API / type | What it does | Input or shape | Returns | On error |
 | --- | --- | --- | --- | --- |
-| `configure(config)` | Set global attribute rules and custom tags | `config: { defaults?, nodes }` | Frozen `DeepReadonly<JzayMarkConfig>` | Throws `JzayMarkError` with `INVALID_CONFIG` |
-| `parse(text, options?)` | Convert Markdown and custom tags into the standard AST | `text: string`; `options` accepts only `version` and `mode`; unknown options report `INVALID_OPTIONS` | `JzayAst` | Normal mode may report `INVALID_MARKER`, `UNCLOSED_MARKER`, `INVALID_ATTRIBUTE`, `DUPLICATE_ATTRIBUTE`, `UNEXPECTED_CLOSE`, `MISMATCHED_CLOSE`, or `UNCLOSED_NODE`; both modes may report `INVALID_SOURCE`, `INVALID_OPTIONS`, `UNSUPPORTED_VERSION`, or `UNSUPPORTED_MARKDOWN` |
+| `configure(config)` | Set global attribute rules, custom tags, and optional syntax sugar | `config: { defaults?, nodes }` | Frozen `DeepReadonly<JzayMarkConfig>` | Throws `JzayMarkError` with `INVALID_CONFIG` |
+| `parse(text, options?)` | Convert Markdown, custom tags, and syntax sugar into the standard AST | `text: string`; `options` accepts only `version` and `mode`; unknown options report `INVALID_OPTIONS` | `JzayAst` | Normal mode may report `INVALID_MARKER`, `UNCLOSED_MARKER`, `INVALID_ATTRIBUTE`, `DUPLICATE_ATTRIBUTE`, `UNEXPECTED_CLOSE`, `MISMATCHED_CLOSE`, or `UNCLOSED_NODE`; both modes may report `INVALID_CONFIG`, `INVALID_SOURCE`, `INVALID_OPTIONS`, `UNSUPPORTED_VERSION`, or `UNSUPPORTED_MARKDOWN` |
 | `print(ast)` | Convert the standard AST back into Markdown and custom tags | `ast: JzayAst` | `string` | Throws `UNSUPPORTED_VERSION`, `UNKNOWN_NODE`, `INVALID_AST`, or `UNPRINTABLE_PROP` |
 | `JzayMarkError` | Describe configuration, parsing, and printing errors consistently | `code: JzayMarkErrorCode`, `message: string`, and optional `location: { line, column, offset }` | — | `JzayMarkErrorCode` is the exported error-code type |
 
@@ -143,6 +143,120 @@ A literal closing delimiter inside a `raw` body also uses backslash escaping. `p
 
 `parse` nodes may be nested up to 256 levels. Beyond that limit, both normal and loose modes report `INVALID_SOURCE` so abnormal input cannot exhaust runtime resources.
 
+#### `syntaxSugar`: shortcuts for a standard node
+
+`syntaxSugar` is an optional array on a node. It only recognizes shortcut text and maps captures to that node's properties or body. The node type, `body`, placement, nesting, AST shape, and printed form all come from the owning node.
+
+This example adds `@Liu` as a shortcut for the standard single tag `<mention name="Liu">`:
+
+```ts
+configure({
+  nodes: {
+    mention: {
+      body: 'none',
+      syntax: { open: '<mention {props}>' },
+      syntaxSugar: [{
+        match: /@(?<name>[\p{L}\p{N}_-]{1,64})(?=\s|$|[,.!?])/gu,
+        map: {
+          props: { name: '$name' },
+        },
+      }],
+    },
+  },
+})
+```
+
+Input:
+
+```text
+@Liu Please prepare the materials
+```
+
+`@Liu` becomes:
+
+```ts
+{ type: 'mention', props: { name: 'Liu' } }
+```
+
+`print()` always uses the node's canonical `syntax`, so the complete output is:
+
+```text
+<mention name="Liu"> Please prepare the materials
+```
+
+Each rule has exactly two fields:
+
+| Field | Purpose |
+| --- | --- |
+| `match` | A JavaScript `RegExp`; it must use the Unicode `u` flag, cannot use sticky `y`, and cannot match an empty string |
+| `map` | A structured `{ props?, body? }` mapping, or a synchronous function returning that shape or `null` |
+
+Structured mappings support `$0` for the full match, numbered captures such as `$1`, named captures such as `$name`, and `$$` for a literal dollar sign:
+
+```ts
+syntaxSugar: [{
+  match: /@(?<name>[\p{L}]+)-(?<id>\d+)/gu,
+  map: {
+    props: {
+      name: '$name',
+      id: '$id',
+      source: '$0',
+      active: true,
+    },
+  },
+}]
+```
+
+Use a synchronous mapper when a preloaded lookup table or conditional logic is needed. Its input, `captures`, and `groups` are frozen read-only values. Returning `null` preserves the original text:
+
+```ts
+const usersByName = new Map([
+  ['Liu', { id: 'user-1', name: 'Liu' }],
+])
+
+syntaxSugar: [{
+  match: /@(?<name>[\p{L}\p{N}_-]+)/gu,
+  map(match) {
+    const user = usersByName.get(match.groups.name ?? '')
+    return user ? { props: { id: user.id, name: user.name } } : null
+  },
+}]
+```
+
+`parse()` remains synchronous, so `map` cannot be `async` and should not issue a database or network request for each match. Load data in a batch and build an in-memory index first; return `null` for missing or ambiguous names. A thrown exception, Promise result, illegal field, or unprintable property reports `INVALID_CONFIG` in both parse modes.
+
+Body mappings inherit the owning node's `body` mode:
+
+```ts
+highlight: {
+  body: 'raw',
+  syntaxSugar: [{
+    match: /==(?<content>[^=\r\n]+)==/gu,
+    map: { body: '$content' }, // stored in value
+  }],
+},
+
+note: {
+  body: 'parse',
+  syntaxSugar: [{
+    match: /::(?<content>[^:\r\n]+)::/gu,
+    map: { body: '$content' }, // parsed into children
+  }],
+},
+```
+
+- A `body: 'none'` node cannot map `body`.
+- A `body: 'raw'` mapping becomes `value`.
+- A `body: 'parse'` mapping is parsed into `children`, but generated body text does not trigger syntax sugar again in the same pass, preventing conversion loops.
+
+Syntax sugar runs in both normal and loose modes; it is not error recovery. JzayMark recognizes canonical custom syntax and Markdown first, then applies sugar only to Markdown `text` ranges. Code, link/image destinations, `raw` bodies, recognized canonical custom nodes, and nodes generated during the current sugar pass are not matched. Ordinary text inside a `body: 'parse'` node remains eligible.
+
+Sugar follows the same-placement rule: it converts only where the canonical node is valid. For example, a sugar rule that would generate block body content remains literal text inside a phrasing container such as `strong`, rather than creating an invalid AST. On conflicts, JzayMark chooses the earliest source position, then the longer match, then the rule declared later. If a later mapper returns `null`, the next rule at that position is tried.
+
+Backslash is the universal sugar escape even when a rule starts with a letter: both `\@Liu` and `\TODO` remain literal text. `print()` automatically protects literal text that could reactivate sugar and continues to guarantee semantic `AST → text → AST` stability. A single parse may generate at most 10,000 sugar nodes.
+
+Native JavaScript regexes can suffer catastrophic backtracking. Rules in a configuration file must come from trusted developers and avoid unsafe nested quantifiers. If patterns come from remote configuration or end users, use a restricted engine such as RE2 in the application instead of constructing native `RegExp` objects directly.
+
 #### Configuration precedence
 
 Configuration applies in this order, with later levels overriding earlier levels:
@@ -155,6 +269,7 @@ System defaults → defaults.props → node configuration
 2. A node's `props` then overrides `defaults.props` field by field. Its `syntax` and `body` affect only that node.
 3. When syntax is duplicated or conflicts at the same level, the node declared later in `nodes` wins.
 4. Custom syntax is recognized before Markdown, so a later node can intentionally override a conflicting Markdown construct.
+5. Syntax sugar runs after canonical custom syntax and Markdown identify ordinary text. On an equal-position, equal-length conflict, the sugar declared later wins.
 
 When a conflict affects output, `print()` tries an equivalent Markdown form, such as `_emphasis_` instead of `*emphasis*`. If the active configuration cannot represent an AST node losslessly, or an older node is fully shadowed by a later declaration, `print()` reports `INVALID_AST` instead of emitting incorrect content.
 
@@ -287,6 +402,9 @@ Unknown tags and other raw HTML fragments are plain text in both modes and never
 | Scenario | Normal mode `normal` | Loose mode `loose` |
 | --- | --- | --- |
 | Configured tag with valid syntax and Markdown placement | Parse with the node's `syntax`, `props`, and `body` | Same behavior |
+| Sugar match whose owning node is valid at that position | Map it to the owning node | Same behavior |
+| Sugar miss, mapper returning `null`, or owning node invalid at that position | Preserve plain text | Same behavior |
+| Sugar mapper throwing or returning an invalid mapping | Report `INVALID_CONFIG` | Report the same error without recovery |
 | Unconfigured tag | Preserve both opening and closing tags as plain text while parsing Markdown between them normally | Same behavior |
 | Duplicate attribute | Report `DUPLICATE_ATTRIBUTE` | Keep the first value and ignore later duplicates |
 | Invalid attribute syntax | Report `INVALID_ATTRIBUTE` | Preserve the complete tag source as plain text; continue parsing after a single tag, and preserve the body and closing tag with a paired tag |
@@ -309,6 +427,8 @@ Add a backslash before the custom tag's `open`. Escape both the opening and clos
 ```text
 \<example>plain text\</example>
 ```
+
+Syntax sugar uses the same backslash escape. After configuring `@name` or `TODO`, both `\@Liu` and `\TODO` remain plain text.
 
 ### How is invalid syntax handled?
 

@@ -11,6 +11,9 @@ import type {
   ResolvedJzayMarkConfig,
   ResolvedNodeConfig,
   ResolvedPropsConfig,
+  ResolvedSyntaxSugarRule,
+  SyntaxSugarMapping,
+  SyntaxSugarMatch,
 } from './config.js'
 import { JzayMarkError, locationAt, raise } from './diagnostics.js'
 import type { InternalMarkdownNode } from './internal-markdown.js'
@@ -44,6 +47,7 @@ interface ParseContext {
   tokens: Map<string, TokenRecord>
   blockNodes: WeakSet<JzayNode>
   nodeLiterals: WeakMap<JzayNode, string>
+  syntaxSugarMatches: number
 }
 
 interface SyntaxEventBase {
@@ -84,6 +88,7 @@ interface ScanResult {
 }
 
 const MAX_PARSE_NESTING_DEPTH = 256
+const MAX_SYNTAX_SUGAR_MATCHES = 10_000
 
 const BASE_STRINGIFY_OPTIONS = {
   fences: true,
@@ -163,6 +168,171 @@ function parseMarkdownTree(source: string): MarkdownNode {
 function walk(node: MarkdownNode, visit: (node: MarkdownNode) => void): void {
   visit(node)
   for (const child of node.children ?? []) walk(child, visit)
+}
+
+interface MarkdownTextRange {
+  start: number
+  end: number
+  parentType: string
+}
+
+interface SyntaxSugarCandidate {
+  definition: ResolvedNodeConfig
+  rule: ResolvedSyntaxSugarRule
+  match: RegExpExecArray
+}
+
+function textRanges(node: MarkdownNode, parentType = 'root', result: MarkdownTextRange[] = []): MarkdownTextRange[] {
+  if (node.type === 'text') {
+    const start = node.position?.start.offset
+    const end = node.position?.end.offset
+    if (typeof start === 'number' && typeof end === 'number' && end > start) {
+      result.push({ start, end, parentType })
+    }
+    return result
+  }
+  for (const child of node.children ?? []) textRanges(child, node.type, result)
+  return result
+}
+
+function syntaxSugarPattern(rule: ResolvedSyntaxSugarRule): RegExp {
+  const flags = rule.flags.includes('g') ? rule.flags : `${rule.flags}g`
+  return new RegExp(rule.source, flags)
+}
+
+function nextRuleMatch(
+  value: string,
+  cursor: number,
+  rule: ResolvedSyntaxSugarRule,
+): RegExpExecArray | undefined {
+  const pattern = syntaxSugarPattern(rule)
+  pattern.lastIndex = cursor
+  const match = pattern.exec(value)
+  if (!match) return undefined
+  if (match[0].length === 0) raise('INVALID_CONFIG', `${rule.path}.match 不能匹配空字符串`)
+  return match
+}
+
+function nextSyntaxSugarCandidates(
+  value: string,
+  cursor: number,
+  config: Readonly<ResolvedJzayMarkConfig>,
+): SyntaxSugarCandidate[] {
+  let earliest = Number.POSITIVE_INFINITY
+  const candidates: SyntaxSugarCandidate[] = []
+  for (const definition of config.orderedNodes) {
+    for (const rule of definition.syntaxSugar) {
+      const match = nextRuleMatch(value, cursor, rule)
+      if (!match) continue
+      if (match.index < earliest) {
+        earliest = match.index
+        candidates.length = 0
+      }
+      if (match.index === earliest) candidates.push({ definition, rule, match })
+    }
+  }
+  return candidates.sort((left, right) => (
+    right.match[0].length - left.match[0].length || right.rule.order - left.rule.order
+  ))
+}
+
+function syntaxSugarMatch(match: RegExpExecArray): SyntaxSugarMatch {
+  const groups: Record<string, string | undefined> = Object.create(null) as Record<string, string | undefined>
+  for (const [key, value] of Object.entries(match.groups ?? {})) groups[key] = value
+  return Object.freeze({
+    value: match[0],
+    index: match.index,
+    captures: Object.freeze(match.slice(1)),
+    groups: Object.freeze(groups),
+  })
+}
+
+function expandSyntaxSugarTemplate(template: string, match: SyntaxSugarMatch, path: string): string {
+  return template.replace(/\$\$|\$([A-Za-z_][A-Za-z0-9_]*|\d+)/gu, (token, reference: string | undefined) => {
+    if (token === '$$') return '$'
+    if (reference === '0') return match.value
+    if (reference && /^\d+$/u.test(reference)) {
+      const index = Number(reference) - 1
+      if (index < 0 || index >= match.captures.length) {
+        raise('INVALID_CONFIG', `${path} 引用了不存在的捕获组 $${reference}`)
+      }
+      return match.captures[index] ?? ''
+    }
+    if (!reference || !Object.prototype.hasOwnProperty.call(match.groups, reference)) {
+      raise('INVALID_CONFIG', `${path} 引用了不存在的命名捕获组 $${String(reference)}`)
+    }
+    return match.groups[reference] ?? ''
+  })
+}
+
+function isObjectRecord(value: unknown): value is Record<string, unknown> {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return false
+  const prototype = Object.getPrototypeOf(value) as unknown
+  return prototype === Object.prototype || prototype === null
+}
+
+function checkedSyntaxSugarMapping(
+  value: unknown,
+  definition: ResolvedNodeConfig,
+  rule: ResolvedSyntaxSugarRule,
+  match: SyntaxSugarMatch,
+  structured: boolean,
+): SyntaxSugarMapping {
+  if (!isObjectRecord(value)) raise('INVALID_CONFIG', `${rule.path}.map 必须返回对象或 null`)
+  const unknown = Object.keys(value).find((key) => !['props', 'body'].includes(key))
+  if (unknown) raise('INVALID_CONFIG', `${rule.path}.map 不支持字段 ${unknown}`)
+  const result: SyntaxSugarMapping = {}
+  if (value.props !== undefined) {
+    if (!isObjectRecord(value.props)) raise('INVALID_CONFIG', `${rule.path}.map.props 必须是对象`)
+    const props: Record<string, string | true> = Object.create(null) as Record<string, string | true>
+    for (const [key, rawValue] of Object.entries(value.props)) {
+      if (!validAttributeKey(key, definition.props)) {
+        raise('INVALID_CONFIG', `${rule.path}.map.props 的属性名 ${JSON.stringify(key)} 无法由标准语法输出`)
+      }
+      if (rawValue !== true && typeof rawValue !== 'string') {
+        raise('INVALID_CONFIG', `${rule.path}.map.props.${key} 必须是字符串或 true`)
+      }
+      props[key] = structured && typeof rawValue === 'string'
+        ? expandSyntaxSugarTemplate(rawValue, match, `${rule.path}.map.props.${key}`)
+        : rawValue
+    }
+    if (Object.keys(props).length > 0) {
+      if (!definition.syntax.open.includes('{props}')) {
+        raise('INVALID_CONFIG', `${rule.path}.map 生成了属性，但节点 ${definition.name} 的标准语法没有 {props}`)
+      }
+      result.props = props
+    }
+  }
+  if (value.body !== undefined) {
+    if (definition.body === 'none') {
+      raise('INVALID_CONFIG', `${rule.path}.map.body 不适用于 body 为 none 的节点`)
+    }
+    if (typeof value.body !== 'string') raise('INVALID_CONFIG', `${rule.path}.map.body 必须是字符串`)
+    result.body = structured
+      ? expandSyntaxSugarTemplate(value.body, match, `${rule.path}.map.body`)
+      : value.body
+  }
+  return result
+}
+
+function resolveSyntaxSugarMapping(
+  candidate: SyntaxSugarCandidate,
+): SyntaxSugarMapping | null {
+  const match = syntaxSugarMatch(candidate.match)
+  if (typeof candidate.rule.map !== 'function') {
+    return checkedSyntaxSugarMapping(candidate.rule.map, candidate.definition, candidate.rule, match, true)
+  }
+  let mapped: unknown
+  try {
+    mapped = candidate.rule.map(match)
+  } catch (error) {
+    raise(
+      'INVALID_CONFIG',
+      `${candidate.rule.path}.map 执行失败：${error instanceof Error ? error.message : String(error)}`,
+    )
+  }
+  if (mapped === null) return null
+  return checkedSyntaxSugarMapping(mapped, candidate.definition, candidate.rule, match, false)
 }
 
 function codeRanges(tree: MarkdownNode): ProtectedRange[] {
@@ -702,11 +872,151 @@ function flowChildren(node: MarkdownNode, context: ParseContext): JzayNode[] {
   return result
 }
 
-function bodyChildren(markdown: string, context: ParseContext, block: boolean): JzayNode[] {
-  const tree = parseMarkdownTree(markdown)
+function bodyChildren(
+  markdown: string,
+  context: ParseContext,
+  block: boolean,
+  applySyntaxSugar = true,
+): JzayNode[] {
+  const tree = parseMarkdownTreeWithSyntaxSugar(markdown, context, applySyntaxSugar)
   const nodes = block ? flowChildren(tree, context) : fromMarkdownChildren(tree, context)
   if (!block && nodes.length === 1 && nodes[0]?.type === 'paragraph') return nodes[0].children ?? []
   return nodes
+}
+
+function syntaxSugarNode(
+  candidate: SyntaxSugarCandidate,
+  parentType: string,
+  context: ParseContext,
+): JzayNode | undefined {
+  const mapping = resolveSyntaxSugarMapping(candidate)
+  if (mapping === null) return undefined
+  const node: JzayNode = {
+    type: candidate.definition.name,
+    ...(mapping.props ? { props: mapping.props } : {}),
+  }
+  let block = false
+  if (candidate.definition.body === 'raw') {
+    node.value = mapping.body ?? ''
+  } else if (candidate.definition.body === 'parse') {
+    const children = bodyChildren(mapping.body ?? '', context, false, false)
+    node.children = children
+    block = requiresBlockPlacement(children, context)
+    if (block && parentType !== 'paragraph' && PHRASING_PARENTS.has(parentType)) return undefined
+  }
+  if (block) context.blockNodes.add(node)
+  context.nodeLiterals.set(node, candidate.match[0])
+  return node
+}
+
+function transformSyntaxSugarText(
+  value: string,
+  parentType: string,
+  context: ParseContext,
+): string {
+  let result = ''
+  let cursor = 0
+  while (cursor < value.length) {
+    const candidates = nextSyntaxSugarCandidates(value, cursor, context.config)
+    const first = candidates[0]
+    if (!first) return `${result}${value.slice(cursor)}`
+    const matchAt = first.match.index
+    if (isEscaped(value, matchAt)) {
+      result += value.slice(cursor, matchAt - 1)
+      const literal = first.match[0]
+      result += newToken(context, {
+        node: { type: 'text', value: literal },
+        block: false,
+        literal,
+      })
+      cursor = matchAt + literal.length
+      continue
+    }
+    result += value.slice(cursor, matchAt)
+    let selected: { candidate: SyntaxSugarCandidate, node: JzayNode } | undefined
+    for (const candidate of candidates) {
+      const node = syntaxSugarNode(candidate, parentType, context)
+      if (node) {
+        selected = { candidate, node }
+        break
+      }
+    }
+    if (selected) {
+      context.syntaxSugarMatches += 1
+      if (context.syntaxSugarMatches > MAX_SYNTAX_SUGAR_MATCHES) {
+        raise('INVALID_SOURCE', `语法糖单次转换不能超过 ${MAX_SYNTAX_SUGAR_MATCHES} 次`)
+      }
+      const literal = selected.candidate.match[0]
+      result += newToken(context, {
+        node: selected.node,
+        block: context.blockNodes.has(selected.node),
+        literal,
+      })
+      cursor = selected.candidate.match.index + literal.length
+      continue
+    }
+    const codePoint = value.codePointAt(matchAt)
+    const width = codePoint !== undefined && codePoint > 0xffff ? 2 : 1
+    result += value.slice(matchAt, matchAt + width)
+    cursor = matchAt + width
+  }
+  return result
+}
+
+function transformSyntaxSugarRange(
+  value: string,
+  parentType: string,
+  context: ParseContext,
+): string {
+  const tokens = [...context.tokens.keys()]
+  if (tokens.length === 0) return transformSyntaxSugarText(value, parentType, context)
+  let result = ''
+  let cursor = 0
+  while (cursor < value.length) {
+    let tokenAt = Number.POSITIVE_INFINITY
+    let selectedToken: string | undefined
+    for (const token of tokens) {
+      const index = value.indexOf(token, cursor)
+      if (index !== -1 && index < tokenAt) {
+        tokenAt = index
+        selectedToken = token
+      }
+    }
+    if (!selectedToken) return `${result}${transformSyntaxSugarText(value.slice(cursor), parentType, context)}`
+    result += transformSyntaxSugarText(value.slice(cursor, tokenAt), parentType, context)
+    result += selectedToken
+    cursor = tokenAt + selectedToken.length
+  }
+  return result
+}
+
+function transformSyntaxSugarMarkdown(
+  markdown: string,
+  tree: MarkdownNode,
+  context: ParseContext,
+): string {
+  if (!context.config.orderedNodes.some((definition) => definition.syntaxSugar.length > 0)) return markdown
+  const ranges = textRanges(tree).sort((left, right) => left.start - right.start)
+  let result = ''
+  let cursor = 0
+  for (const range of ranges) {
+    if (range.start < cursor || range.end > markdown.length) continue
+    result += markdown.slice(cursor, range.start)
+    result += transformSyntaxSugarRange(markdown.slice(range.start, range.end), range.parentType, context)
+    cursor = range.end
+  }
+  return `${result}${markdown.slice(cursor)}`
+}
+
+function parseMarkdownTreeWithSyntaxSugar(
+  markdown: string,
+  context: ParseContext,
+  applySyntaxSugar = true,
+): MarkdownNode {
+  const tree = parseMarkdownTree(markdown)
+  if (!applySyntaxSugar) return tree
+  const transformed = transformSyntaxSugarMarkdown(markdown, tree, context)
+  return transformed === markdown ? tree : parseMarkdownTree(transformed)
 }
 
 function requiresBlockPlacement(nodes: JzayNode[], context: ParseContext): boolean {
@@ -1123,9 +1433,10 @@ export function parseMarkdown(
     tokens: new Map(),
     blockNodes: new WeakSet(),
     nodeLiterals: new WeakMap(),
+    syntaxSugarMatches: 0,
   }
   const scanned = scan(source, 0, source.length, context)
-  return createAst(flowChildren(parseMarkdownTree(scanned.markdown), context))
+  return createAst(flowChildren(parseMarkdownTreeWithSyntaxSugar(scanned.markdown, context), context))
 }
 
 interface PrintContext {
@@ -1240,13 +1551,18 @@ function protectLiteralText(value: string, context: PrintContext): string {
     tokens: new Map(),
     blockNodes: new WeakSet(),
     nodeLiterals: new WeakMap(),
+    syntaxSugarMatches: 0,
   }
   let result = ''
   let emittedUntil = 0
   let cursor = 0
   while (cursor < value.length) {
     const event = eventAt(value, cursor, value.length, scanner)
-    if (!event) {
+    const sugar = event
+      ? undefined
+      : nextSyntaxSugarCandidates(value, cursor, context.config)
+        .find((candidate) => candidate.match.index === cursor)
+    if (!event && !sugar) {
       const codePoint = value.codePointAt(cursor)
       const width = codePoint !== undefined && codePoint > 0xffff ? 2 : 1
       if (width === 2) {
@@ -1261,12 +1577,13 @@ function protectLiteralText(value: string, context: PrintContext): string {
     while (slashStart > emittedUntil && value[slashStart - 1] === '\\') slashStart -= 1
     const slashCount = cursor - slashStart
     result += value.slice(emittedUntil, slashStart)
+    const eventEnd = event?.end ?? ((sugar?.match.index ?? cursor) + (sugar?.match[0].length ?? 0))
     result += printToken(
       context,
-      `${'\\'.repeat(slashCount * 2 + (event.kind === 'text' ? 0 : 1))}${value.slice(cursor, event.end)}`,
+      `${'\\'.repeat(slashCount * 2 + (event?.kind === 'text' ? 0 : 1))}${value.slice(cursor, eventEnd)}`,
     )
-    emittedUntil = event.end
-    cursor = event.end
+    emittedUntil = eventEnd
+    cursor = eventEnd
   }
   return `${result}${value.slice(emittedUntil)}`
 }
